@@ -13,6 +13,7 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   (`/v1/messages`) for Claude Code.
 
 ### Changed
+- CI: `checks` workflow (CPU build, ctest, Python tests) runs on every pull request; required before merge.
 - MoE decode runs the shared expert inside the routed expert launches. MiniCPM-V 4.7 35B-A3B on one RTX 3090:
   IQ3_S 207.8 -> 220.1 tok/s, Q5_K_M (2000 MiB experts in host memory) 176.5 -> 187.1 tok/s. Output identical.
 
