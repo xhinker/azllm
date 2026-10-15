@@ -115,11 +115,15 @@ private:
         std::vector<uint32_t> partial;
         uint64_t version = 0;
         RepeatGuard repeat;
+        TimingPulse pulse;   // llama.cpp-style 3 s progress line for this request
+        uint64_t n_gen = 0;
     };
 
     // after a step: the slot's ids go to the stream and through the repeat guard (tripped -> the request ends)
     bool step_done(Job & job, int slot) {
         const auto ids = model_.spec_tokens(slot);
+        job.n_gen = ids.size();  // spec_tokens returns the whole sequence, not the step delta
+        job.pulse.step(job.n_gen);
         const bool tripped = job.repeat.check(ids);
         if (job.stream) publish(job, ids);
         return tripped;
@@ -139,6 +143,7 @@ private:
         model_.select_slot(s);
         uint64_t st[5] = {};
         finish(tokenizer_, job->req, model_.spec_finish(st), job->result);
+        job->result.cached_tokens = model_.cached_prefix();  // the timing block rates only the prefilled part
         set_timings(job->result, st);
         complete(job);
     }
@@ -192,7 +197,9 @@ private:
                     model_.select_slot(int(s));
                     model_.set_sampling(job->req.temperature, job->req.top_p, job->req.top_k, job->req.seed);
                     if (!job->images.spans.empty()) model_.set_prompt_images(job->images.spans);
+                    job->pulse.start(uint32_t(job->prompt.size()), [this] { return model_.prefill_progress(); });
                     model_.spec_begin(job->prompt, job->count, draft_length());
+                    job->pulse.generating();
                 } catch (const std::exception & e) {
                     job->result.error = std::string("generation failed: ") + e.what();  // tqserve kFailed: HTTP 500
                     complete(job);

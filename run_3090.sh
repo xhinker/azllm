@@ -38,4 +38,5 @@ args=(--model "$MODEL" -md "$DRAFTER" --draft-vocab "$DRAFT_VOCAB"
 [ -n "$TEMPLATE" ] && args+=(--chat-template-file "$TEMPLATE")
 
 echo "tqserve: $(basename "$MODEL") on GPU $GPU, port $PORT, context $CONTEXT, kv $KV"
-exec env CUDA_VISIBLE_DEVICES="$GPU" ./build/tqserve "${args[@]}"
+export CUDA_VISIBLE_DEVICES="$GPU"
+exec ./build/tqserve "${args[@]}"

@@ -56,6 +56,10 @@ struct Engine {
         throw std::runtime_error("batched speculative decoding not supported for this model");
     }
     virtual std::vector<uint32_t> spec_finish(uint64_t *) { return {}; }
+    // prompt tokens the last request reused from the prompt cache instead of prefilling them
+    virtual uint32_t cached_prefix() const { return 0; }
+    // prompt tokens of the running prefill the GPU has finished (0 when the engine does not track it)
+    virtual uint32_t prefill_progress() const { return 0; }
     virtual std::vector<uint32_t> spec_tokens(int) const { return {}; }  // slot's ids so far (streaming)
     // DFlash drafter training data: prefill `tokens` from position 0 and return the drafter's target features
     // [P][nf * hidden] (raw BF16 bits) of every position; returns nf (0: no drafter loaded)

@@ -1,3 +1,178 @@
+## azllm: why this fork
+
+azllm is a fork of [tqllm](https://github.com/turbo-tan/tqllm) set up to run Qwen3.8-27B as a daily driver for coding
+agents on a single consumer GPU. The engine, weight formats and sampling are untouched; everything below is serve
+layer and setup tooling.
+
+### 1. The answer now streams when tool schemas are present
+
+Upstream streamed `reasoning_content` correctly but buffered the answer: `update()` short-circuited text emission
+whenever the request carried a non-empty `tools` array, so the reply arrived as a single `content` delta at `close()`.
+Agent clients send tool schemas on every turn, so what you saw was thinking ticking along live and then the entire
+answer at once, which is indistinguishable from "this server cannot stream".
+
+The buffer had a reason. Function calls ride in the same text as prose, and `extract_tool_calls()` only runs over the
+finished text, so forwarding raw deltas would leak markup into the answer. But that function keeps
+`trim(text.substr(0, first))`: the answer is always a prefix of the raw text cut at the first markup marker, so
+everything before that marker is already final prose. The fix streams up to the first marker and holds back only the
+tail that could still grow into one, mirroring the stop-sequence hold `emit()` already applies.
+
+Measured with Qwen3.8-27B-TQ3_4S + DFlash2 on one RTX 3090, `tools` non-empty:
+
+| Request | Before | After |
+|---|---|---|
+| Prose answer | 1 content delta | 13 deltas, no markup in any of them |
+| Prose then a function call | 1 delta | 16 deltas, `finish_reason` still `tool_calls` |
+| Function call only | 0 deltas | 0 deltas, nothing to stream |
+| Request without tools | unchanged | unchanged |
+
+### 2. llama.cpp-style timing, live on the console
+
+Timings used to exist only in the API response, so the console stayed silent for the whole request and a slow one
+looked like a hang. Every request now prints a block in the shape llama.cpp's `print_timing` uses:
+
+```
+tqserve: prompt eval time =   1059.76 ms /   1215 tokens (   0.87 ms per token,  1146.49 tokens per second)
+tqserve:         eval time =    851.14 ms /    282 tokens (   3.02 ms per token,   331.32 tokens per second)
+tqserve:        total time =   1910.90 ms / 135763 tokens
+tqserve:  draft acceptance = 0.63187 (   230 accepted /    364 drafted), mean len =  5.42
+tqserve:  prompt cache =  134266 of 135481 prompt tokens reused, not prefilled
+```
+
+and while a request is still running you get a pulse every 3 s, so a long prefill is visibly moving:
+
+```
+tqserve: pp =    18432 / 38530 prompt tokens ( 47%),   1535.9 t/s,   1535.9 t/s avg
+tqserve: pp =    37888 / 38530 prompt tokens ( 98%),   1194.6 t/s,   1403.2 t/s avg
+tqserve: n_gen =    406, tg = 201.63 t/s, tg_3s = 135.33 t/s
+```
+
+- **`pp`** is prefill. The token count is what the GPU has finished, not what the CPU has queued: each prefill chunk
+  records a CUDA event and the pulse walks them until the first one still pending, which is why the live average
+  lands within about 1% of the final `prompt eval time` instead of racing ahead of it. The first rate covers the
+  last 3 s, the second is the average since prefill began, and the percentage is progress toward the prompt total.
+  When the interval rate drops below the average you are watching attention cost grow with context.
+- **`n_gen` / `tg` / `tg_3s`** are generated tokens, average rate since generation began, and rate over the last 3 s.
+- **`draft acceptance`** is the MTP / DFlash2 acceptance rate with mean accepted length. Watch this before blaming
+  context length when decode looks slow: acceptance moves the rate far more than prompt size does.
+- Prompt rates count **computed** tokens only. With `--prompt-cache on` a cached prefix is never prefilled, so the
+  denominator is `prompt - cached`, while `usage.prompt_tokens` in the API response still reports the whole prompt
+  because that is what a client is billed for.
+
+`TQLLM_LOG_TIMINGS=0` silences all of it. Everything goes to stderr under one mutex so parallel slots cannot
+interleave mid-line.
+
+### 3. get_models.py and run_3090.sh
+
+Two scripts, both relative to the checkout, so they work wherever you clone it.
+
+`get_models.py` fetches a weight file plus the DFlash2 drafter and its 65,536-token draft vocabulary, into the exact
+layout the launch script expects:
+
+```sh
+python3 get_models.py                     # default TQ3_4S, drafter and draft vocab into ./models
+python3 get_models.py --type TQ3_4S-v2    # same weights with the fixed v22 chat template embedded
+python3 get_models.py --type TQ_L         # best quality published build, TQ4 body, 14.72 GB
+python3 get_models.py --type TQ3_4S-v2 --mmproj     # + the BF16 vision projector
+python3 get_models.py --no-drafter --dir /data/models   # weights only, somewhere else
+```
+
+Types: `TQ3_4S` (default), `TQ3_4S-v2`, `TQ_XS`, `TQ_S`, `TQ_M`, `TQ_L`.
+
+`run_3090.sh` serves one file on a 24 GB card and documents its own knobs in the header:
+
+```sh
+./run_3090.sh                          # TQ3_4S-v2, GPU 0, port 8086, 262K context, q4/q4 KV
+GPU=1 ./run_3090.sh                    # pick the card
+PORT=8090 ./run_3090.sh                # pick the port
+CONTEXT=131072 ./run_3090.sh           # if weights plus KV will not fit
+KV=tq3 ./run_3090.sh                   # q4/q4 (default), tq3, q8, bf16
+MODEL=models/Qwen3.8-27B-TQ_L.gguf TEMPLATE=models/chat_template_v22.jinja ./run_3090.sh
+```
+
+The script exports `CUDA_VISIBLE_DEVICES` instead of prefixing the command with `env`, and that is deliberate: a
+`~/.local/bin/env` PATH shim (installed by uv) shadows `/usr/bin/env` on many setups, so
+`env CUDA_VISIBLE_DEVICES=1 ./build/tqserve ...` runs the shim, which edits `PATH` and exits 0. The server never
+starts and prints nothing at all.
+
+### 4. Fastest path from clone to first token
+
+```sh
+git clone https://github.com/xhinker/azllm.git && cd azllm
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=native
+cmake --build build --target tqserve -j"$(nproc)"
+python3 get_models.py --type TQ3_4S-v2      # ~14.5 GB: weights, drafter, draft vocab
+./run_3090.sh                               # ready when it prints "listening on 0.0.0.0:8086"
+```
+
+Then from anywhere else:
+
+```sh
+curl -s localhost:8086/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "tqllm",
+  "messages": [{"role": "user", "content": "Name one prime number."}],
+  "max_tokens": 64
+}'
+```
+
+Point any OpenAI-compatible client at `http://localhost:8086/v1` with model name `tqllm`. Four things that save time:
+
+- **Give `max_tokens` room.** Reasoning is on by default (`--reasoning on` in the launch script) and it bills against
+  the same budget, so `max_tokens: 24` can return an empty `content` with every token spent on `reasoning_content`.
+  Per request, set `"chat_template_kwargs": {"enable_thinking": false}` or `"reasoning_budget_tokens": 0` to skip
+  thinking, or `"reasoning_effort"` to dial it down.
+- **The silence after the banner is normal.** Loading 14.5 GB of weights takes 20-40 s with no output between the
+  `loading model` line and `listening`.
+- **Budget the memory.** A 24 GB card fits one 27B at 262K context with `q4/q4` KV, about 23 GB resident. Drop to
+  `CONTEXT=131072` if you want headroom; a 32 GB card takes the same config with ~8 GB spare.
+- **Know which template your file carries.** `TQ3_4S-v2` embeds the fixed v22 template and needs nothing. `TQ_XS`,
+  `TQ_S`, `TQ_M` and `TQ_L` embed the official template, which fails on tool arguments sent as a JSON string, so
+  pass `TEMPLATE=models/chat_template_v22.jinja`.
+
+### 5. Measured on consumer cards (2026-10-14)
+
+Same engine build, same 262,144-token context, `q4/q4` KV, DFlash2 drafter, `--prompt-cache on`, temperature 0.
+Prompts are random-word filler at four sizes, generated fresh each run so nothing hits the prompt cache unless the
+row says so. Repeats: 3, 3, 2 and 1; prefill varied under 2% within a size, decode up to +-20%.
+
+Prefill and decode in tokens/s (cold cache):
+
+| Prompt | TQ_L, RTX 3090 Ti | TQ3_4S-v2, RTX 3090 Ti | TQ_L, RTX 5090 |
+|---|---|---|---|
+| short, ~135 tok | 566 / 211 | 650 / 207 | **1,319 / 333** |
+| medium, ~2,350 tok | 1,481 / 139 | 1,453 / 128 | **2,848 / 241** |
+| long, ~36,550 tok | 1,403 / 118 | 1,363 / 166 | **2,826 / 233** |
+| xlong, ~145,900 tok | 941 / 127 | 922 / 140 | **2,078 / 243** |
+
+End to end, which is what you actually wait for:
+
+| Request | TQ_L, RTX 3090 Ti | TQ_L, RTX 5090 |
+|---|---|---|
+| short, 128 tokens out | 0.8 s | **0.5 s** |
+| medium, 256 out | 3.3 s | **1.9 s** |
+| long, 256 out | 28.2 s | **14.0 s** |
+| xlong, 128 out | 156.3 s | **70.8 s** |
+| long prompt, warm cache (first token) | 185 ms | **92 ms** |
+
+What the numbers say:
+
+- **The 5090 is a clean ~2x on everything**: prefill 1.9-2.3x, decode 1.6-2.0x, consistently across all four sizes.
+- **The quant choice does not move speed.** TQ_L and TQ3_4S-v2 differ by 220 MB and by 2-3% in prefill, which is
+  noise. Their decode columns look different only because draft acceptance differed (0.24-0.32 vs 0.40-0.44);
+  acceptance is a property of the text generated, not of the weight format. Pick between them on output quality.
+- **Small prompts prefill badly and it does not matter**: 566-650 tok/s at 135 tokens, because one short sequence
+  cannot fill a GEMM batch. That is 0.2 s of wall clock.
+- **The long-context cliff is the same shape on both cards**: 36K to 146K costs 33% of prefill on the 3090 Ti and
+  26% on the 5090. Quadratic attention scales, it does not disappear.
+- **The prompt cache is the biggest lever available.** One 36,564-token prompt, twice: 26.2 s cold, 185 ms warm on
+  the 3090 Ti (141x), 13.2 s cold, 92 ms warm on the 5090. Anything with a stable prefix stops paying prefill.
+- **Memory**: 23,006 MiB of 24,564 on the 3090 Ti, 23,644 MiB of 32,607 on the 5090. Same config, but only the 5090
+  has ~8 GB left over for a bigger context, a second slot, or a second resident model.
+
+Caveats worth repeating: single slot, so no concurrency was measured; reasoning was on, so decode counts thinking
+tokens as output; clocks were sustained rather than boost (3090 Ti at 1875 of 2115 MHz and 396 W, 5090 at 2782 MHz
+and 439 W); and the 146K prompt used 56% of the configured context.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/tqllm-logo-dark.png">

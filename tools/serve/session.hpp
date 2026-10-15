@@ -16,8 +16,13 @@
 #include <cstdlib>
 #include <ctime>
 #include <functional>
+#include <iostream>
 #include <memory>
+#include <atomic>
+#include <condition_variable>
 #include <mutex>
+#include <optional>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -494,11 +499,133 @@ struct DecodeResult {
     // engine timings (llama.cpp `timings` fields): prefill / decode wall time, speculative drafts proposed / accepted
     double prefill_ms = 0, decode_ms = 0;
     uint64_t draft_n = 0, draft_accepted = 0;
+    uint32_t cached_tokens = 0;  // reused from the prompt cache: prefill_ms covers only the tokens after them
     std::string finish_reason = "length";
     std::string error;
 };
 
 inline void extract_tool_calls(DecodeResult & r);
+
+// llama.cpp `print_timing` console stats: a pulse every ~3 s while a request generates and one block
+// per finished request. Silence with TQLLM_LOG_TIMINGS=0.
+inline bool log_timings() {
+    static const bool on = [] {
+        const char * e = std::getenv("TQLLM_LOG_TIMINGS");
+        return !e || e[0] != '0';
+    }();
+    return on;
+}
+inline std::mutex & log_mutex() {
+    static std::mutex m;
+    return m;
+}
+// one block per request, in llama.cpp print_timing shape: prefill / decode / total, then spec acceptance
+inline void print_timing(const DecodeResult & r, uint64_t steps) {
+    if (!log_timings() || !r.error.empty() || (r.prompt_tokens == 0 && r.completion_tokens == 0)) return;
+    // --prompt-cache: the engine prefills only what the cached prefix does not cover, so the rate belongs
+    // to the tokens actually computed. The full prompt still counts in `usage`, which is billed.
+    const uint32_t computed = r.prompt_tokens > r.cached_tokens ? r.prompt_tokens - r.cached_tokens : r.prompt_tokens;
+    char buf[640];
+    int n = std::snprintf(buf, sizeof buf,
+        "tqserve: prompt eval time = %9.2f ms / %6u tokens (%7.2f ms per token, %8.2f tokens per second)\n"
+        "tqserve:         eval time = %9.2f ms / %6u tokens (%7.2f ms per token, %8.2f tokens per second)\n"
+        "tqserve:        total time = %9.2f ms / %6u tokens\n",
+        r.prefill_ms, computed, computed ? r.prefill_ms / computed : 0.0,
+        r.prefill_ms > 0 ? computed * 1000.0 / r.prefill_ms : 0.0,
+        r.decode_ms, r.completion_tokens, r.completion_tokens ? r.decode_ms / r.completion_tokens : 0.0,
+        r.decode_ms > 0 ? r.completion_tokens * 1000.0 / r.decode_ms : 0.0,
+        r.prefill_ms + r.decode_ms, r.prompt_tokens + r.completion_tokens);
+    if (r.draft_n > 0 && n > 0 && size_t(n) < sizeof buf) {
+        const int w = std::snprintf(buf + n, sizeof buf - size_t(n),
+            "tqserve:  draft acceptance = %7.5f (%6llu accepted / %6llu drafted), mean len = %5.2f\n",
+            double(r.draft_accepted) / double(r.draft_n), (unsigned long long)r.draft_accepted,
+            (unsigned long long)r.draft_n, steps ? double(r.completion_tokens) / double(steps) : 0.0);
+        if (w > 0) n += w;
+    }
+    if (r.cached_tokens && n > 0 && size_t(n) < sizeof buf)
+        std::snprintf(buf + n, sizeof buf - size_t(n),
+            "tqserve:  prompt cache = %7u of %6u prompt tokens reused, not prefilled\n",
+            r.cached_tokens, r.prompt_tokens);
+    const std::lock_guard<std::mutex> lock(log_mutex());
+    std::cerr << buf;
+}
+// Live speed line every 3 s while a request runs, from a heartbeat thread. Prefill reports elapsed time
+// only: chunks are queued ahead of the GPU, so no honest token count exists until spec_begin returns (the
+// engine line "prompt cache: N of M prompt tokens reused" gives the split). Generation reports tokens/s
+// overall and over the last interval. step() runs on the request thread; the heartbeat reads atomics and
+// never touches the engine. Silence with TQLLM_LOG_TIMINGS=0.
+struct TimingPulse {
+    TimingPulse() = default;
+    TimingPulse(const TimingPulse &) = delete;
+    TimingPulse & operator=(const TimingPulse &) = delete;
+    ~TimingPulse() { stop(); }
+    void start(uint32_t prompt_n, std::function<uint32_t()> progress = {}) {  // call before prefill begins
+        if (!log_timings() || th_.joinable()) return;
+        total_ = prompt_n;
+        progress_ = std::move(progress);  // engine-side count of prefilled tokens, or empty for elapsed only
+        t0_ = std::chrono::steady_clock::now();
+        th_ = std::jthread([this](std::stop_token) { beat(); });
+    }
+    void generating() {  // prefill returned; tokens start counting
+        const std::lock_guard<std::mutex> lock(cv_mu_);
+        if (!t_gen_.has_value()) t_gen_ = std::chrono::steady_clock::now();
+    }
+    void step(uint64_t n_gen) { n_gen_.store(n_gen); }
+    void stop() {
+        if (!th_.joinable()) return;
+        { std::lock_guard<std::mutex> lock(cv_mu_); done_ = true; }
+        cv_.notify_all();
+        th_.join();
+    }
+
+private:
+    void beat() {
+        auto last = t0_;
+        uint64_t last_n = 0;
+        uint32_t last_done = 0;
+        for (;;) {
+            std::unique_lock<std::mutex> lk(cv_mu_);
+            if (cv_.wait_for(lk, std::chrono::seconds(3), [this] { return done_; })) return;
+            const bool gen = t_gen_.has_value();
+            const auto tgen = gen ? *t_gen_ : t0_;
+            lk.unlock();
+            const auto now = std::chrono::steady_clock::now();
+            const double el = std::chrono::duration<double>(now - last).count();
+            char buf[192];
+            if (!gen && progress_) {
+                const uint32_t done = progress_();
+                const double avg = std::chrono::duration<double>(now - t0_).count();
+                const uint32_t pct = total_ ? std::min<uint32_t>(100u, done * 100u / total_) : 0u;
+                std::snprintf(buf, sizeof buf,
+                              "tqserve: pp = %8u / %u prompt tokens (%3u%%), %8.1f t/s, %8.1f t/s avg\n",
+                              done, total_, pct, el > 0 ? double(done - last_done) / el : 0.0,
+                              avg > 0 ? double(done) / avg : 0.0);
+                last_done = done;
+            } else if (!gen) {
+                std::snprintf(buf, sizeof buf, "tqserve: pp = prefilling %8u prompt tokens, %6.1f s elapsed\n",
+                              total_, std::chrono::duration<double>(now - t0_).count());
+            } else {
+                const uint64_t n = n_gen_.load();
+                const double since = std::chrono::duration<double>(now - tgen).count();
+                std::snprintf(buf, sizeof buf, "tqserve: n_gen = %6llu, tg = %6.2f t/s, tg_3s = %6.2f t/s\n",
+                              (unsigned long long)n, since > 0 ? double(n) / since : 0.0,
+                              el > 0 ? double(n - last_n) / el : 0.0);
+                last_n = n;
+            }
+            { const std::lock_guard<std::mutex> lock(log_mutex()); std::cerr << buf; }
+            last = now;
+        }
+    }
+    std::condition_variable cv_;
+    std::mutex cv_mu_;
+    bool done_ = false;
+    std::optional<std::chrono::steady_clock::time_point> t_gen_;
+    std::atomic<uint64_t> n_gen_{0};
+    uint32_t total_ = 0;
+    std::function<uint32_t()> progress_;
+    std::chrono::steady_clock::time_point t0_ = std::chrono::steady_clock::now();
+    std::jthread th_;
+};
 
 // stats from generate_spec / spec_finish: steps, drafted, accepted, decode us, prefill us
 inline void set_timings(DecodeResult & r, const uint64_t * st) {
@@ -506,6 +633,7 @@ inline void set_timings(DecodeResult & r, const uint64_t * st) {
     r.draft_accepted = st[2];
     r.decode_ms = double(st[3]) / 1000.0;
     r.prefill_ms = double(st[4]) / 1000.0;
+    print_timing(r, st[0]);
 }
 
 // Server-wide vision encoder (--mmproj); requests encode under the mutex (the encoder reuses its buffers).
@@ -669,19 +797,29 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
     if (incremental) {
         model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed);
         if (!images.spans.empty()) model.set_prompt_images(images.spans);
+        TimingPulse pulse;
+        pulse.start(uint32_t(prompt.size()), [&model] { return model.prefill_progress(); });
         model.spec_begin(prompt, count, draft_length(model.native_mtp()));
+        pulse.generating();
         RepeatGuard guard;
-        while (model.spec_advance())
-            if (guard.check(model.spec_tokens(0))) break;
+        while (model.spec_advance()) {
+            const auto ids = model.spec_tokens(0);
+            pulse.step(ids.size());
+            if (guard.check(ids)) break;
+        }
         uint64_t st[5] = {};
         finish(tokenizer, req, model.spec_finish(st), result);
+        result.cached_tokens = model.cached_prefix();
         set_timings(result, st);
         return result;
     }
+    TimingPulse pulse;
+    pulse.start(uint32_t(prompt.size()));
     const auto t0 = std::chrono::steady_clock::now();
     for (uint32_t i = 0; i + 1 < prompt.size(); ++i) model.forward(prompt[i], i, false);
     uint32_t next = model.forward(prompt.back(), static_cast<uint32_t>(prompt.size() - 1), true);
     const auto t1 = std::chrono::steady_clock::now();
+    pulse.generating();
     result.prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     struct DecodeClock {  // decode time ends when the loop exits, whichever way
         DecodeResult & r;
@@ -698,6 +836,7 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
             break;
         }
         output.push_back(next);
+        pulse.step(output.size());
         if (guard.check(output)) break;
         result.text = tokenizer.decode(output);
         bool stopped = false;
@@ -826,8 +965,9 @@ inline void usage_timings(std::string & out, const DecodeResult & result) {
     // llama.cpp-style engine timings; the first token comes from prefill, so decode rate = (n - 1) / decode time
     const uint32_t n = result.completion_tokens;
     auto num = [](double v) { char b[32]; std::snprintf(b, sizeof b, "%.3f", v); return std::string(b); };
-    out += ",\"timings\":{\"prompt_n\":" + std::to_string(result.prompt_tokens) + ",\"prompt_ms\":" + num(result.prefill_ms);
-    out += ",\"prompt_per_second\":" + num(result.prefill_ms > 0 ? result.prompt_tokens * 1000.0 / result.prefill_ms : 0);
+    const uint32_t computed = result.prompt_tokens > result.cached_tokens ? result.prompt_tokens - result.cached_tokens : result.prompt_tokens;
+    out += ",\"timings\":{\"prompt_n\":" + std::to_string(computed) + ",\"prompt_cached\":" + std::to_string(result.cached_tokens) + ",\"prompt_ms\":" + num(result.prefill_ms);
+    out += ",\"prompt_per_second\":" + num(result.prefill_ms > 0 ? computed * 1000.0 / result.prefill_ms : 0);
     out += ",\"predicted_n\":" + std::to_string(n) + ",\"predicted_ms\":" + num(result.decode_ms);
     out += ",\"predicted_per_second\":" + num(result.decode_ms > 0 && n > 1 ? (n - 1) * 1000.0 / result.decode_ms : 0);
     out += ",\"draft_n\":" + std::to_string(result.draft_n) + ",\"draft_n_accepted\":" + std::to_string(result.draft_accepted) + "}";
@@ -849,7 +989,9 @@ public:
         for (size_t k = std::min(seen_ + 1, gen.size()); k <= gen.size() && k > seen_; ++k) {
             DecodeResult r;
             finish(tok_, plain_, std::vector<uint32_t>(gen.begin(), gen.begin() + std::ptrdiff_t(k)), r);
-            if (!emit(r.reasoning, sr_, true, false) || !(req_.tools || emit(r.text, sc_, false, false))) return false;
+            if (!emit(r.reasoning, sr_, true, false)) return false;
+            if (req_.tools) { if (!emit_tool_text(r.text, sc_)) return false; }
+            else if (!emit(r.text, sc_, false, false)) return false;
         }
         seen_ = std::max(seen_, gen.size());
         return true;
@@ -886,7 +1028,12 @@ public:
     }
     bool error(const std::string & message) { return send_("data: " + json_error(message) + "\n\n"); }
     // thinking budget: send what is left of a phase's deltas without the final chunk; a phase-2 writer skips the role
-    bool flush(const DecodeResult & r) { return emit(r.reasoning, sr_, true, true) && (req_.tools || emit(r.text, sc_, false, true)); }
+    bool flush(const DecodeResult & r) {
+        if (!emit(r.reasoning, sr_, true, true)) return false;
+        if (!req_.tools) return emit(r.text, sc_, false, true);
+        const size_t end = tool_text_limit(r.text);  // tool markup: nothing past the first block is ours to send
+        return end <= sc_.size() ? true : emit(r.text.substr(0, end), sc_, false, true);
+    }
     void mark_role_sent() { role_sent_ = true; }
 
 private:
@@ -909,6 +1056,21 @@ private:
             return need > k ? k : 0;
         }
         return 0;
+    }
+    // Tool calls are in-band markup: extract_tool_calls() cuts the answer at the first block and keeps
+    // trim(text.substr(0, first)), so everything before the marker is final prose and can stream. A tail
+    // that could still grow into the marker is held back, the same way emit() holds back stop sequences.
+    static size_t tool_text_limit(const std::string & t) {
+        static const std::string m = "<" "function=";
+        const auto p = t.find(m);
+        size_t end = (p == std::string::npos) ? t.size() : p;
+        for (size_t k = std::min(end, m.size() - 1); k > 0; --k)
+            if (t.compare(end - k, k, m, 0, k) == 0) { end -= k; break; }
+        return end;
+    }
+    bool emit_tool_text(const std::string & raw, std::string & sent) {
+        const size_t end = tool_text_limit(raw);
+        return end <= sent.size() ? true : emit(raw.substr(0, end), sent, false, false);
     }
     bool emit(const std::string & full, std::string & sent, bool reasoning, bool final) {
         if (full.size() <= sent.size() || full.compare(0, sent.size(), sent) != 0) return true;  // nothing new / not a prefix
@@ -958,14 +1120,21 @@ inline DecodeResult decode_stream(const tqllm::Tokenizer & tokenizer, tqllm::Mod
     if (!result.error.empty()) return result;
     model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed);
     if (!images.spans.empty()) model.set_prompt_images(images.spans);
+    TimingPulse pulse;
+    pulse.start(uint32_t(prompt.size()), [&model] { return model.prefill_progress(); });
     model.spec_begin(prompt, count, draft_length(model.native_mtp()));
+    pulse.generating();
     RepeatGuard guard;
+    uint64_t n_gen = 0;
     while (model.spec_advance()) {
         const auto ids = model.spec_tokens(0);
+        n_gen = ids.size();  // spec_tokens returns the whole sequence, not the step delta
+        pulse.step(n_gen);
         if (guard.check(ids) || !on_tokens(ids)) break;
     }
     uint64_t st[5] = {};
     finish(tokenizer, req, model.spec_finish(st), result);
+    result.cached_tokens = model.cached_prefix();
     set_timings(result, st);
     return result;
 }
