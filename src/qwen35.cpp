@@ -4,6 +4,7 @@
 #include "batch_graph_key.hpp"
 #include "engine.hpp"
 #include <random>
+#include <atomic>
 #include "json.hpp"
 #include "qwen2_kernels.cuh"
 #include "gguf.hpp"
@@ -709,6 +710,44 @@ private:
     // shares only that much (a chat template re-renders the previous answer without its think tags).
     static constexpr uint32_t kTail = 64;
     bool pc_on = false, pc_live = false;
+    uint32_t last_pc = 0;  // prompt tokens the last request reused from the cache
+    // Prefill progress for the serve layer's 3 s heartbeat. Chunks are queued onto one stream far ahead of
+    // the GPU, so the loop counter would report queue position, not work done: one event per chunk, and a
+    // query walks them until the first that is still pending. pf_cum[i] is published by the release store on
+    // pf_n, so a reader that acquires pf_n sees every cumulative count up to it.
+    std::vector<cudaEvent_t> pf_ev;
+    std::vector<uint32_t> pf_cum;
+    std::atomic<uint32_t> pf_n{0};
+
+    void pf_progress_begin(uint32_t chunks) {
+        while (uint32_t(pf_ev.size()) < chunks) {
+            cudaEvent_t e = nullptr;
+            if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) return;  // progress off
+            pf_ev.push_back(e);
+        }
+        pf_cum.assign(pf_ev.size(), 0);
+        pf_n.store(0, std::memory_order_release);
+    }
+    void pf_progress_tick(uint32_t done_tokens, cudaStream_t s) {
+        const uint32_t i = pf_n.load(std::memory_order_relaxed);
+        if (i >= uint32_t(pf_ev.size())) return;
+        pf_cum[i] = done_tokens;
+        if (cudaEventRecord(pf_ev[i], s) != cudaSuccess) return;
+        pf_n.store(i + 1, std::memory_order_release);
+    }
+    uint32_t pf_progress_done() const {
+        const uint32_t n = pf_n.load(std::memory_order_acquire);
+        uint32_t done = 0;
+        for (uint32_t i = 0; i < n; ++i) {
+            const cudaError_t r = cudaEventQuery(pf_ev[i]);
+            if (r == cudaSuccess) done = pf_cum[i];
+            else {
+                if (r != cudaErrorNotReady) cudaGetLastError();  // keep a real failure out of last-error
+                break;
+            }
+        }
+        return done;
+    }
     uint32_t pc_snap = 0;
     std::vector<uint32_t> pc_seq;
     std::unique_ptr<HostBuf> pc_host;
@@ -3635,6 +3674,7 @@ public:
         }
         // prompt reuse: positions [0, P0) are already cached; a boundary at snap keeps the state for the next request
         const uint32_t P0 = pc_on && images.empty() ? pc_match(prompt) : 0;
+        last_pc = P0;
         if (P0 < pc_snap) pc_snap = 0;
         pc_live = false;
         const uint32_t snap = pc_on && P >= P0 + 2 * kTail ? P - kTail : 0;
@@ -3651,6 +3691,7 @@ public:
             // prefill chunk: NPF tokens through the GEMM path (the dump needs every argmax)
             const int CH = tf_path ? NVER : std::clamp(NPF, 1, NBUF);
             const size_t chunks = (P - P0 + CH - 1) / CH + 1;  // + 1: the split at snap
+            pf_progress_begin(uint32_t(chunks));
             HostBuf staged_tokens(size_t(P) * sizeof(uint32_t));
             HostBuf staged_pos(chunks * 2 * sizeof(int));
             std::memcpy(staged_tokens.p, prompt.data(), size_t(P) * sizeof(uint32_t));
@@ -3676,6 +3717,7 @@ public:
                                            cudaMemcpyHostToDevice, stream));
                     verify_async(static_cast<const uint32_t *>(staged_tokens.p) + t, positions + 2 * ci,
                                  m, t, final ? h_tok : nullptr, false);
+                    pf_progress_tick(uint32_t(t) + uint32_t(m), stream);
                     if (tf_host) ck(cudaMemcpyAsync(tf_host + t, v_tok.p, size_t(m) * 4, cudaMemcpyDeviceToHost, stream));
                     commit(m);
                     if (use_mtp) {
@@ -4449,6 +4491,8 @@ public:
         } else dflash_step(slots, n, done);
     }
     std::vector<uint32_t> spec_finish(uint64_t * stats) override { return dflash_finish(stats); }
+    uint32_t cached_prefix() const override { return last_pc; }
+    uint32_t prefill_progress() const override { return pf_progress_done(); }
     std::vector<uint32_t> spec_tokens(int s) const override { return s == active ? gen.out : parked[size_t(s)].gen.out; }
     int drafter_features(const std::vector<uint32_t> & tokens, std::vector<uint16_t> & feats) override {
         if (!dfl.present) return 0;

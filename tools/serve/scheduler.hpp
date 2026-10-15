@@ -143,6 +143,7 @@ private:
         model_.select_slot(s);
         uint64_t st[5] = {};
         finish(tokenizer_, job->req, model_.spec_finish(st), job->result);
+        job->result.cached_tokens = model_.cached_prefix();  // the timing block rates only the prefilled part
         set_timings(job->result, st);
         complete(job);
     }
@@ -196,7 +197,9 @@ private:
                     model_.select_slot(int(s));
                     model_.set_sampling(job->req.temperature, job->req.top_p, job->req.top_k, job->req.seed);
                     if (!job->images.spans.empty()) model_.set_prompt_images(job->images.spans);
+                    job->pulse.start(uint32_t(job->prompt.size()), [this] { return model_.prefill_progress(); });
                     model_.spec_begin(job->prompt, job->count, draft_length());
+                    job->pulse.generating();
                 } catch (const std::exception & e) {
                     job->result.error = std::string("generation failed: ") + e.what();  // tqserve kFailed: HTTP 500
                     complete(job);
