@@ -87,8 +87,17 @@ GPU=1 ./run_3090.sh                    # pick the card
 PORT=8090 ./run_3090.sh                # pick the port
 CONTEXT=131072 ./run_3090.sh           # if weights plus KV will not fit
 KV=tq3 ./run_3090.sh                   # q4/q4 (default), tq3, q8, bf16
+MAX_TOKENS=32768 ./run_3090.sh         # default output cap per request (16384)
 MODEL=models/Qwen3.8-27B-TQ_L.gguf TEMPLATE=models/chat_template_v22.jinja ./run_3090.sh
 ```
+
+`MAX_TOKENS` is the server's default output cap (`--max-tokens`), and it binds whether or not the client asked for a
+cap: `session.hpp` finishes parsing a request with `req.max_tokens = std::min(req.max_tokens, default_max_tokens)`, so
+a request for 100000 tokens against a server started with `--max-tokens 4096` gets 4096 and nothing in the response says
+so. Thinking is on by default and bills against that same budget, so the turn simply ends early with
+`finish_reason: length` and the model reads as one that stops mid-sentence. The default was 4096 until 2026-10-15;
+16384 leaves room for a long think plus a long answer, and against the 262144 default context it still leaves 245760
+tokens for the prompt.
 
 The script exports `CUDA_VISIBLE_DEVICES` instead of prefixing the command with `env`, and that is deliberate: a
 `~/.local/bin/env` PATH shim (installed by uv) shadows `/usr/bin/env` on many setups, so
@@ -172,6 +181,65 @@ What the numbers say:
 Caveats worth repeating: single slot, so no concurrency was measured; reasoning was on, so decode counts thinking
 tokens as output; clocks were sustained rather than boost (3090 Ti at 1875 of 2115 MHz and 396 W, 5090 at 2782 MHz
 and 439 W); and the 146K prompt used 56% of the configured context.
+
+### 6. Model and runtime metadata on `/v1/models`, `/props` and `/health`
+
+Upstream's `/v1/models` answered with `{"id","object","owned_by"}` and nothing else, so a client could not ask the
+server how much context it actually has. llama.cpp answers that question and clients read the answer: AZ PAL takes
+`data[].meta.n_ctx` and, failing that, `max_context` from `/health` at the server root. Without one of those a client
+falls back to whatever number someone typed into a config file, which is how a profile ends up carrying another
+machine's context window. tqserve now reports it, under llama.cpp's field names:
+
+```sh
+curl -s localhost:8086/v1/models | python3 -m json.tool
+```
+
+```json
+{"id": "tqllm", "object": "model", "owned_by": "tqllm",
+ "meta": {"vocab_type": 2, "n_vocab": 248320, "n_ctx": 262144, "n_ctx_train": 262144,
+          "n_embd": 5120, "n_params": 27320697856, "size": 14721469184, "ftype": "TQ4 - 4.12 bpw"}}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `n_ctx` | positions ONE request gets: `--context` divided by `--np`, cut further if the memory fit said so |
+| `n_ctx_train` | the checkpoint's `qwen35.context_length`, 262144 for Qwen3.8-27B |
+| `n_params` | element count of the tensor directory; matches llama.cpp on the same checkpoint to the unit |
+| `size` | the weight file on disk, in bytes |
+| `ftype` | measured from the bytes that store the TQ body, NOT from `general.file_type`: the TQ converter stamps that key 15, which in llama.cpp's enum claims Q4_K_M for a file whose tensors are type 300 |
+
+`GET /props` carries `n_ctx_train` and the vocabulary's `bos` / `eos` / `eot` token ids. Both endpoints, and `/health`,
+also return a `tqllm` object holding the facts upstream clients have no field name for, so nothing can mistake them for
+llama.cpp fields: `slots`, `max_tokens`, `kv`, `kv_store`, `draft`, `reasoning`, `reasoning_effort`, `weight_types` and
+`prompt_cache_active`.
+
+Watch that last one. Prefix reuse needs a single slot, so `--np 2` costs a client every cached prefix and the log never
+mentions it; `prompt_cache_active` reads `false` the moment that happens. `/health` publishes `max_context`, `slots`,
+`max_tokens` and `prompt_cache_active` for probes that do not read `/v1/models` at all.
+
+All of it is read once at startup from the GGUF header in `tools/serve/model_info.hpp`. No engine file is involved, so
+the fork still merges upstream without conflict.
+
+### Updates
+
+Newest first. Everything below is serve layer or tooling; the engine, weight formats and sampling stay upstream.
+
+**2026-10-15: model and runtime metadata on the API; a larger default output cap**
+
+- `GET /v1/models`, `GET /v1/models/<name>`, `GET /props` and `GET /health` publish the model and runtime numbers under
+  llama.cpp's field names, so a client reads its context window from the server rather than from a config file (§6).
+  `n_params` computed here agrees with llama.cpp on the same checkpoint exactly: 27,320,697,856.
+- `run_3090.sh` raises its default `MAX_TOKENS` from 4096 to 16384. A request above the server default is clamped to it
+  without an error, and thinking bills against the same budget, so 4096 surfaced as turns ending mid-sentence with
+  `finish_reason: length` (§3).
+
+**2026-10-14: streaming with tool schemas, live timing, launch tooling**
+
+- The answer now streams when a request carries `tools`; upstream buffered it until `close()` (§1).
+- llama.cpp-style timing on the console: computed tokens, GPU progress, live pulse (§2).
+- `get_models.py` and `run_3090.sh` for a single-GPU box (§3), and measured numbers on consumer cards for TQ3_4S, TQ_S
+  and TQ_L (§5).
+
 
 <p align="center">
   <picture>
