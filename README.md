@@ -16,6 +16,7 @@ finished text, so forwarding raw deltas would leak markup into the answer. But t
 `trim(text.substr(0, first))`: the answer is always a prefix of the raw text cut at the first markup marker, so
 everything before that marker is already final prose. The fix streams up to the first marker and holds back only the
 tail that could still grow into one, mirroring the stop-sequence hold `emit()` already applies.
+The hold-back covers both the function-call and the tool-call markers, so neither can leak a partial tag into the stream.
 
 Measured with Qwen3.8-27B-TQ3_4S + DFlash2 on one RTX 3090, `tools` non-empty:
 
@@ -223,6 +224,13 @@ the fork still merges upstream without conflict.
 ### Updates
 
 Newest first. Everything below is serve layer or tooling; the engine, weight formats and sampling stay upstream.
+
+**2026-10-16: the tool-stream hold-back also covers the tool-call marker**
+
+- The hold-back that keeps tool-call markup out of the streamed answer now stops at the tool-call marker as well as the
+  function-call marker, matching where `extract_tool_calls()` cuts. Prose before a tool call streams, and a tail that
+  could still grow into either marker is withheld, so no partial tag leaks into the deltas (§1). `test-serve` gained a
+  regression test for it.
 
 **2026-10-15: model and runtime metadata on the API; a larger default output cap**
 

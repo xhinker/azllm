@@ -21,6 +21,9 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   IQ3_S 207.8 -> 220.1 tok/s, Q5_K_M (2000 MiB experts in host memory) 176.5 -> 187.1 tok/s. Output identical.
 
 ### Fixed
+- The streamed answer no longer leaks a partial tool-call marker: the hold-back now also stops at the tool-call marker
+  (where `extract_tool_calls()` cuts), not just the function-call marker, so prose before a tool call streams cleanly.
+  `test-serve` covers it.
 - `tqllm launch codex` failed with Codex CLI 0.16x, which no longer accepts `wire_api = "chat"`; it now uses the native
   Responses API.
 - A request without `max_tokens` was cut at 64 tokens; it now gets the server's `--max-tokens` (OpenAI clients such as

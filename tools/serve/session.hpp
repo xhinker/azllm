@@ -506,6 +506,16 @@ struct DecodeResult {
 
 inline void extract_tool_calls(DecodeResult & r);
 
+inline size_t tool_stream_limit(const std::string & t) {
+    static const std::string markers[2] = {"<" "function=", "<" "tool_call>"};
+    size_t end = t.size();
+    for (const auto & m : markers) { const auto p = t.find(m); if (p != std::string::npos) end = std::min(end, p); }
+    for (const auto & m : markers)
+        for (size_t k = std::min(end, m.size() - 1); k > 0; --k)
+            if (t.compare(end - k, k, m, 0, k) == 0) { end -= k; break; }
+    return end;
+}
+
 // llama.cpp `print_timing` console stats: a pulse every ~3 s while a request generates and one block
 // per finished request. Silence with TQLLM_LOG_TIMINGS=0.
 inline bool log_timings() {
@@ -1057,17 +1067,7 @@ private:
         }
         return 0;
     }
-    // Tool calls are in-band markup: extract_tool_calls() cuts the answer at the first block and keeps
-    // trim(text.substr(0, first)), so everything before the marker is final prose and can stream. A tail
-    // that could still grow into the marker is held back, the same way emit() holds back stop sequences.
-    static size_t tool_text_limit(const std::string & t) {
-        static const std::string m = "<" "function=";
-        const auto p = t.find(m);
-        size_t end = (p == std::string::npos) ? t.size() : p;
-        for (size_t k = std::min(end, m.size() - 1); k > 0; --k)
-            if (t.compare(end - k, k, m, 0, k) == 0) { end -= k; break; }
-        return end;
-    }
+    static size_t tool_text_limit(const std::string & t) { return tool_stream_limit(t); }
     bool emit_tool_text(const std::string & raw, std::string & sent) {
         const size_t end = tool_text_limit(raw);
         return end <= sent.size() ? true : emit(raw.substr(0, end), sent, false, false);
