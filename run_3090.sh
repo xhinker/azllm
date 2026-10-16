@@ -25,7 +25,7 @@ GPU="${GPU:-0}"
 PORT="${PORT:-8086}"
 CONTEXT="${CONTEXT:-262144}"
 KV="${KV:-q4/q4}"
-MAX_TOKENS="${MAX_TOKENS:-4096}"
+MAX_TOKENS="${MAX_TOKENS:-16384}"
 
 [ -x build/tqserve ] || { echo "build/tqserve missing: cmake --build build -j$(nproc)" >&2; exit 1; }
 for f in "$MODEL" "$DRAFTER" "$DRAFT_VOCAB"; do
