@@ -4,6 +4,7 @@
 #include "serve/session.hpp"
 #include "serve/api_adapters.hpp"
 #include "serve/jinja_template.hpp"
+#include "serve/model_info.hpp"
 #include "src/gguf.hpp"
 #include "src/flags_gen.hpp"
 #include "src/formats/kv_format.hpp"
@@ -245,6 +246,23 @@ int main(int argc, char ** argv) {
         const auto model_ptr = std::make_unique<tqllm::Model>(model_path, tokenizer_path, context / np, int(np), engine);
         const uint32_t slot_context = model_ptr->context();  // the memory fit may have halved it
         tqllm::Model & model = *model_ptr;
+        // What the server knows about itself, published on /v1/models, /props and /health under the field
+        // names llama.cpp uses, so a client reads the context window from the server instead of guessing
+        // it in a config file (and a copied profile stops carrying another machine's number).
+        tqserve::ModelInfo minfo = tqserve::read_model_info(model_path, name);
+        minfo.n_ctx = slot_context;  // per slot: llama.cpp reports the runtime context for the same reason
+        minfo.slots = np;
+        minfo.max_tokens = max_tokens;
+        minfo.kv = engine.kv.empty() ? engine.cache_k + "/" + engine.cache_v : engine.kv;
+        minfo.kv_store = engine.kv_store;
+        minfo.draft = engine.draft_model;
+        minfo.prompt_cache = engine.prompt_cache ? "on" : "off";
+        // prefix reuse needs a single slot: --np > 1 costs a client every prefix hit, silently
+        minfo.cache_active = ((engine.prompt_cache || engine.kv_compact > 0) && np == 1) ? "on" : "off";
+        minfo.reasoning = reasoning ? "on" : "off";
+        minfo.effort = reasoning ? effort : "off";
+        const std::string models_body = tqserve::models_json(minfo);
+        const std::string props_body = tqserve::props_json(minfo);
         std::unique_ptr<tqserve::Scheduler> scheduler;
         if (np > 1) scheduler = std::make_unique<tqserve::Scheduler>(tokenizer, model, slot_context);
         std::atomic<int> inflight{0};
@@ -327,7 +345,12 @@ int main(int argc, char ** argv) {
             if (request.method == "GET" && request.path == "/health") {
                 std::string fit;  // what the memory fit chose (KV, context, buffers); quotes cannot occur in it
                 for (char ch : model.fit_note()) if (ch != '"' && ch != '\\') fit += ch;
-                body = "{\"status\":\"ok\",\"engine\":\"" TQLLM_COMMIT "\",\"fit\":\"" + fit + "\"}";
+                body = "{\"status\":\"ok\",\"engine\":\"" TQLLM_COMMIT "\",\"fit\":\"" + fit +
+                       "\",\"max_context\":" + std::to_string(minfo.n_ctx) +
+                       ",\"n_ctx_train\":" + std::to_string(minfo.n_ctx_train) +
+                       ",\"slots\":" + std::to_string(minfo.slots) +
+                       ",\"max_tokens\":" + std::to_string(minfo.max_tokens) +
+                       ",\"prompt_cache_active\":" + std::string(minfo.cache_active == "on" ? "true" : "false") + "}";
             } else if (request.path == "/admin/slots" && (request.method == "GET" || request.method == "POST")) {
                 // live parallelism: POST {"slots": k} admits at most k requests at once (1 .. --np), no reload
                 if (!scheduler) {
@@ -347,9 +370,9 @@ int main(int argc, char ** argv) {
                     if (status == 200) body = scheduler->status_json();
                 }
             } else if (request.method == "GET" && (request.path == "/v1/models" || request.path == "/v1/models/" + name)) {
-                body = "{\"object\":\"list\",\"data\":[{\"id\":";
-                tqserve::jstr(body, name);
-                body += ",\"object\":\"model\",\"owned_by\":\"tqllm\"}]}";
+                body = models_body;
+            } else if (request.method == "GET" && request.path == "/props") {  // llama.cpp client settings
+                body = props_body;
             } else if (request.method == "POST" && request.path == "/v1/messages/count_tokens") {
                 body = "{\"input_tokens\":" + std::to_string(request.body.size() / 4) + "}";  // estimate (Claude Code asks)
             } else if (request.method == "POST" && tqserve::api_for_path(request.path) != tqserve::Api::None) {
@@ -478,7 +501,8 @@ int main(int argc, char ** argv) {
                 }
                 if (status != 200 && api == tqserve::Api::Messages) body = tqserve::messages_error(body);
             } else {
-                const bool known_path = request.path == "/health" || request.path == "/v1/models" || request.path == "/admin/slots" ||
+                const bool known_path = request.path == "/health" || request.path == "/v1/models" ||
+                    request.path == "/props" || request.path == "/admin/slots" ||
                     request.path == "/v1/models/" + name || tqserve::api_for_path(request.path) != tqserve::Api::None;
                 status = known_path ? 405 : 404;
                 body = tqserve::json_error(known_path ? "method not allowed" : "not found");
