@@ -21,6 +21,9 @@ struct EngineOptions {
     int prefill_fp8 = -1;  // --prefill-fp8 on|off: prefill GEMMs in FP8 (E4M3, per-row x per-token scales); default on GB10 (validated), opt-in on other sm_89+ GPUs
     bool prompt_cache = false;  // --prompt-cache on|off: one slot keeps the previous request's cache and prefills only the
                                 // part of a new prompt past the shared prefix (on with --kv-compact)
+    int prompt_cache_step = 0;  // --prompt-cache-step N: also keep a recurrent-state snapshot every N prompt tokens, so a
+                                // new prompt that diverges mid-history resumes from the last snapshot before the divergence
+                                // instead of re-prefilling everything. 0: only the tail snapshot (default, unchanged).
     bool kv_stage = true;  // --kv-stage on|off: with --kv-host, old positions move to host and are staged back per layer at
                            // link speed (one slot, compressed KV); off: the newest positions stay in host memory
     long kv_host = -1;  // --kv-host N: last N positions of each sequence's KV in host memory (read over PCIe); -1: the fit

@@ -221,9 +221,66 @@ mentions it; `prompt_cache_active` reads `false` the moment that happens. `/heal
 All of it is read once at startup from the GGUF header in `tools/serve/model_info.hpp`. No engine file is involved, so
 the fork still merges upstream without conflict.
 
+### 7. A prompt cache that survives a rewritten history
+
+`--prompt-cache` keeps the previous request's KV so the next one only prefills what is new, by checking whether the
+prompt it was handed starts with the tokens it already read. In a normal chat every turn only adds to the end, so that
+is true every time and reuse runs 95-99.9%.
+
+That check is yes-or-no, and that is the problem. The engine could resume in exactly two places: the end of what it
+just read, or a snapshot 64 tokens before that end. A client that *edits its own history* breaks both at once. An
+agent that trims a long tool result down to a line before saving the conversation, a memory system that summarises old
+turns, a client that reorders a preamble: all of them send back a prompt that is 99% identical to one already
+computed and differs somewhere in the middle. Neither resume point is usable then, so the outcome is all or nothing -
+nothing reused, the whole conversation read again, tens of seconds before the first token on a 150K conversation.
+Almost every token in that re-read was still correct.
+
+**How to reproduce it.** The server prints what it reused on every request:
+
+    tqllm: prompt cache: 145000 of 145300 prompt tokens reused
+
+Start a server with `--prompt-cache on`, send a long prompt, then send one that extends it unchanged - the second
+line shows near-total reuse. Now send that prompt again with one sentence changed near the beginning. The line shows
+`0 of N` and the prefill runs over everything. Nothing failed; the cache just had nowhere to resume.
+
+**What was added.** `--prompt-cache-step N` writes a bookmark every N prompt tokens while prefilling and keeps the
+last eight. On the next request the engine finds the real shared prefix by binary search and resumes from the deepest
+bookmark at or before it. A bookmark holds the recurrent and short-conv state, which is the part a hybrid model
+cannot recover from nothing; the per-token KV of the attention layers is already in the pool and needs no copy. The
+server prints the size of one bookmark the first time it writes one.
+
+Why bookmarks and not just the search: the attention layers keep one row per token, so a matching prefix is correct
+wherever it happens to stop. The gated-deltanet layers keep a running summary, so "the state at token 128,000" only
+exists if somebody saved it. Without bookmarks, knowing exactly where the two prompts diverge tells you nothing you
+can act on.
+
+| The next prompt | Before | With `--prompt-cache-step 16384` |
+|---|---|---|
+| Adds to the end (every ordinary turn) | reuses everything | same path, same speed |
+| Re-renders only the previous answer | reuses up to the tail snapshot | unchanged |
+| Changes something in the middle (a trimmed tool result) | nothing reused, whole conversation re-read | re-reads at most one step, plus the changed tail |
+| Replaces the oldest turns with a summary | nothing reused | still nothing: the change is at the head, so no bookmark sits before it |
+
+Off by default, and passing nothing leaves the code path untouched. Through the launch script:
+
+    MODEL=models/Qwen3.8-27B-TQ_L.gguf PC_STEP=16384 GPU=2 PORT=8086 ./run_3090.sh
+
+The mechanism is read from the source and the arithmetic follows from it, but no card has measured this yet: the
+table says what the code does, not what a benchmark returned.
+
 ### Updates
 
-Newest first. Everything below is serve layer or tooling; the engine, weight formats and sampling stay upstream.
+Newest first. Everything below is serve layer or tooling; the engine, weight formats and sampling stay upstream -
+with one exception, 2026-10-20, §7.
+
+**2026-10-20: the prompt cache can resume from the middle of a conversation (§7)**
+
+- `--prompt-cache-step N` writes state bookmarks while prefilling, so a prompt that differs mid-history - a trimmed
+  tool result, a re-rendered preamble - resumes from the nearest bookmark instead of re-reading the whole
+  conversation. Off by default; without the flag the path is byte-identical to before. `run_3090.sh` accepts it as
+  `PC_STEP`.
+- First change in the fork that touches the engine rather than the serve layer or the tooling: `src/qwen35.cpp`,
+  `src/options.cpp`, `include/tqllm/options.hpp`. Carry it explicitly when merging upstream.
 
 **2026-10-16: the tool-stream hold-back also covers the tool-call marker**
 
@@ -520,6 +577,7 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 | `--kv-stage on\|off` | on | stream the RAM part back to the GPU layer by layer while decoding |
 | `--kv-compact R [--kv-compact-at idle\|turn]` | off, idle | compress old KV R-fold (not exact; one slot, tq3 or trellis KV) |
 | `--prompt-cache on\|off` | off | keep the previous turn's KV so a follow-up does not re-read the document (one slot; on with `--kv-compact`) |
+| `--prompt-cache-step N` | off | with `--prompt-cache`: bookmark the state every N prompt tokens so a prompt that differs mid-history resumes from the nearest bookmark instead of reading everything again (§7) |
 | `--kv-store flat` | flat | KV storage policy (only flat is served today) |
 | `--rope-scaling none\|linear\|yarn --rope-scale F [--yarn-orig-ctx N]` | none | context past the trained length (llama.cpp names) |
 

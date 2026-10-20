@@ -632,11 +632,42 @@ public:
         cmp_pos = 0, ring_used = 0;
         cmp_upload();
     }
-    void pc_drop() { pc_live = false, pc_snap = 0; }
-    void pc_copy(bool save) {  // recurrent state of slot cur <-> pc_host
+    void pc_drop() { pc_live = false, pc_snap = 0; pc_cks.clear(); }
+    // Longest shared prefix of two token sequences, by binary search over a memcmp test: ~18 passes over a
+    // 200K prompt, microseconds next to the prefill it is deciding whether to skip.
+    static uint32_t common_prefix(const std::vector<uint32_t> & a, const std::vector<uint32_t> & b) {
+        const uint32_t n = uint32_t(std::min(a.size(), b.size()));
+        auto same = [&](uint32_t k) {
+            return k == 0 || std::memcmp(a.data(), b.data(), size_t(k) * sizeof(uint32_t)) == 0;
+        };
+        uint32_t lo = 0, hi = n;
+        while (lo < hi) { const uint32_t mid = lo + (hi - lo + 1) / 2; if (same(mid)) lo = mid; else hi = mid - 1; }
+        return lo;
+    }
+    // The resume point a cached sequence offers for `prompt`: the whole cached sequence when it is a prefix, else the
+    // deepest state snapshot at or before the shared prefix. A snapshot past the divergence belongs to tokens the new
+    // prompt does not have, so it is unusable - which is the whole reason snapshots are taken as we go.
+    uint32_t pc_best(const std::vector<uint32_t> & prompt, uint32_t shared) const {
+        uint32_t best = 0;
+        for (const auto & ck : pc_cks) if (ck.pos <= shared && ck.pos > best && ck.pos < uint32_t(prompt.size())) best = ck.pos;
+        return best;
+    }
+    void pc_ckpt_save(uint32_t pos) {  // one more resumable position, newest `keep` kept
+        if (!pc_cks.size() && opt.prompt_cache_step)
+            std::fprintf(stderr, "tqllm: prompt cache: snapshots of %zu MiB every %d tokens, keeping %zu\n",
+                        (conv_bytes() + rec_bytes()) * (conv_state.size() / NSLOT) >> 20, opt.prompt_cache_step,
+                        size_t(pc_keep));
+        if (pc_cks.size() >= pc_keep) pc_cks.erase(pc_cks.begin());  // oldest first
+        PcCk ck;
+        ck.pos = pos;
+        ck.buf = std::make_unique<HostBuf>((conv_bytes() + rec_bytes()) * (conv_state.size() / NSLOT));
+        pc_copy(true, ck.buf->p);
+        pc_cks.push_back(std::move(ck));
+    }
+    void pc_copy(bool save, void * dst = nullptr) {  // recurrent state of slot cur <-> pc_host (or dst)
         const size_t cb = conv_bytes(), rb = rec_bytes(), nl = conv_state.size() / NSLOT;
-        if (!pc_host) pc_host = std::make_unique<HostBuf>(nl * (cb + rb));
-        auto * h = static_cast<char *>(pc_host->p);
+        if (!dst && !pc_host) pc_host = std::make_unique<HostBuf>(nl * (cb + rb));
+        auto * h = static_cast<char *>(dst ? dst : pc_host->p);
         for (uint32_t l = 0; l < nl; ++l, h += cb + rb) {
             ck(cudaMemcpyAsync(save ? h : static_cast<void *>(conv_slot(l, cur)), save ? static_cast<void *>(conv_slot(l, cur)) : h,
                                cb, cudaMemcpyDefault, stream));
@@ -651,10 +682,21 @@ public:
             return n > 0 && n < P && n <= pc_seq.size() && std::equal(pc_seq.begin(), pc_seq.begin() + n, prompt.begin());
         };
         if (pc_live && shared(uint32_t(pc_seq.size()))) return uint32_t(pc_seq.size());
-        if (!shared(pc_snap)) return 0;
-        if (pend_k) set_pending(0);  // the live state's deferred path is discarded with it
-        pc_copy(false);
-        return pc_snap;
+        if (shared(pc_snap)) {
+            if (pend_k) set_pending(0);  // the live state's deferred path is discarded with it
+            pc_copy(false);
+            return pc_snap;
+        }
+        // Neither fixed point reaches: the prompt diverges earlier (a rewritten history - a stubbed tool result, a
+        // compaction). Without snapshots that is a full re-prefill; with them, resume from the deepest usable one.
+        if (!pc_cks.empty()) {
+            const uint32_t r = pc_best(prompt, common_prefix(pc_seq, prompt));
+            if (r) {
+                for (const auto & ck : pc_cks)
+                    if (ck.pos == r) { if (pend_k) set_pending(0); pc_copy(false, ck.buf->p); return r; }
+            }
+        }
+        return 0;
     }
     size_t kv_pool_layers() const { return size_t(std::count(cfg.full.begin(), cfg.full.end(), true)); }
 
@@ -709,6 +751,12 @@ private:
     // holds the state at pc_snap, a prefill chunk boundary kTail tokens before the last prompt's end, for a prompt that
     // shares only that much (a chat template re-renders the previous answer without its think tags).
     static constexpr uint32_t kTail = 64;
+    // State snapshots at --prompt-cache-step spacing, so a mid-history divergence has somewhere to resume. Each holds
+    // only the recurrent/conv state (the per-position KV of the full-attention layers is already in the pool and needs
+    // no copy); positions past the newest kept one are re-prefilled as today.
+    struct PcCk { uint32_t pos = 0; std::unique_ptr<HostBuf> buf; };
+    std::vector<PcCk> pc_cks;
+    uint32_t pc_keep = 8, pc_next = 0;  // pc_next: the next position to snapshot at
     bool pc_on = false, pc_live = false;
     uint32_t last_pc = 0;  // prompt tokens the last request reused from the cache
     // Prefill progress for the serve layer's 3 s heartbeat. Chunks are queued onto one stream far ahead of
@@ -3676,6 +3724,13 @@ public:
         const uint32_t P0 = pc_on && images.empty() ? pc_match(prompt) : 0;
         last_pc = P0;
         if (P0 < pc_snap) pc_snap = 0;
+        if (!pc_cks.empty()) {  // a snapshot of a token the new prompt does not have cannot be resumed from
+            const uint32_t keep_upto = P0;
+            size_t w = 0;
+            for (size_t i = 0; i < pc_cks.size(); ++i) if (pc_cks[i].pos <= keep_upto) pc_cks[w++] = std::move(pc_cks[i]);
+            pc_cks.resize(w);
+        }
+        pc_next = pc_on && opt.prompt_cache_step ? P0 + uint32_t(opt.prompt_cache_step) : 0;
         pc_live = false;
         const uint32_t snap = pc_on && P >= P0 + 2 * kTail ? P - kTail : 0;
         if (pc_on) pc_seq.assign(prompt.begin(), prompt.end());
@@ -3740,6 +3795,10 @@ public:
                         dflash_inject(v_feat.as<bf16>() + size_t(off) * nf * H, count, t + uint32_t(off));
                     }
                     if (t + uint32_t(m) == snap) pc_copy(true), pc_snap = snap;
+                    if (pc_next && t + uint32_t(m) >= pc_next) {  // first boundary at or past the target
+                        pc_ckpt_save(t + uint32_t(m));
+                        pc_next = t + uint32_t(m) + uint32_t(opt.prompt_cache_step);
+                    }
                     if (show_progress && (final || (t + uint32_t(m)) % 8192 < uint32_t(m))) {
                         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
                         std::fprintf(stderr, "prefill progress %u/%u tokens (%.0f tok/s)\n", t + uint32_t(m), P,

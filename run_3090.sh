@@ -26,6 +26,8 @@ PORT="${PORT:-8086}"
 CONTEXT="${CONTEXT:-262144}"
 KV="${KV:-q4/q4}"
 MAX_TOKENS="${MAX_TOKENS:-16384}"
+PC_STEP="${PC_STEP:-0}"                        # prompt-cache: snapshot state every N tokens so a mid-history
+                                               # divergence resumes instead of re-prefilling (0: off, unchanged)"
 
 [ -x build/tqserve ] || { echo "build/tqserve missing: cmake --build build -j$(nproc)" >&2; exit 1; }
 for f in "$MODEL" "$DRAFTER" "$DRAFT_VOCAB"; do
@@ -36,7 +38,9 @@ args=(--model "$MODEL" -md "$DRAFTER" --draft-vocab "$DRAFT_VOCAB"
       --context "$CONTEXT" --kv "$KV" --prompt-cache on
       --reasoning on --max-tokens "$MAX_TOKENS" --host 0.0.0.0 --port "$PORT")
 [ -n "$TEMPLATE" ] && args+=(--chat-template-file "$TEMPLATE")
+if [ "$PC_STEP" != "0" ] && [ -n "$PC_STEP" ]; then args+=(--prompt-cache-step "$PC_STEP"); fi
 
+[ "$PC_STEP" != "0" ] && echo "tqserve: prompt-cache state snapshots every $PC_STEP tokens"
 echo "tqserve: $(basename "$MODEL") on GPU $GPU, port $PORT, context $CONTEXT, kv $KV"
 export CUDA_VISIBLE_DEVICES="$GPU"
 exec ./build/tqserve "${args[@]}"
