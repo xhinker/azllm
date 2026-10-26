@@ -268,10 +268,55 @@ Off by default, and passing nothing leaves the code path untouched. Through the 
 The mechanism is read from the source and the arithmetic follows from it, but no card has measured this yet: the
 table says what the code does, not what a benchmark returned.
 
+### 8. A guard that rescues a reply that stopped mid-span
+
+A reply can stop in the middle of something it was still writing - a quote left open, a code fence never closed, a
+tag half typed - because the model emitted the turn-end token as if it were text. The turn ends where the model meant
+to keep going. Strata ships a rescue for exactly this (strata-guard); this is that logic, ported to the engine and
+wired into `tqserve` behind a flag.
+
+Two rules, both off by default:
+
+- **Close thinking.** The reply ended with its thinking block still open, so the client got reasoning and no answer.
+  The guard closes the block and lets the model answer - the same two-phase machinery the reasoning budget already
+  uses.
+- **Escape stop.** The answer ends inside an unterminated quote, code span, code block or half-typed tag. The guard
+  appends the escaped spelling of the turn-end token - a zero-width space after its first character, so it cannot
+  re-tokenise into the reserved id - and continues, so the turn can finish.
+
+The span test is the ported predicate: an odd number of quotes in the tail, a trailing `|` or an opening backtick, a
+`<` with no `>` after it, or an open code fence anywhere in the turn. It is unit-tested offline
+(`guard/test_guard.cpp`, 30 checks), and each decision is bounded by a per-request rescue budget.
+
+| The reply ended... | Guard off | With `--guard on` |
+|---|---|---|
+| ...with an open quote / span / fence / half-typed tag | as-is, mid-span | escape appended, the turn continues |
+| ...with its thinking block open (no answer) | reasoning only, no answer | block closed, the model answers |
+| ...normally | unchanged | unchanged (the guard never fires) |
+
+Off by default; without the flag the path is byte-identical to before. The server logs each rescue. Through the
+launch script:
+
+    GUARD=on GPU=2 PORT=8086 ./run_3090.sh
+
+One honest caveat: the continuation re-prefills the reply plus the escape rather than continuing from live state, so
+on some models the turn repeats instead of finishing the span. The detection and the rescue are correct; making the
+continuation stateful is the open follow-up.
+
 ### Updates
 
 Newest first. Everything below is serve layer or tooling; the engine, weight formats and sampling stay upstream -
-with one exception, 2026-10-20, §7.
+with two exceptions, 2026-10-20 (§7) and 2026-10-26 (§8).
+
+**2026-10-26: a guard that rescues a reply that stopped mid-span (§8)**
+
+- `--guard on` enables two rescue rules ported from strata-guard: close an open thinking block (the reply got
+  reasoning but no answer), and escape-stop a reply that ended mid-span (open quote / code span / fence / half-typed
+  tag) by appending the escaped turn-end token and continuing. Off by default; without the flag the path is
+  byte-identical to before. `run_3090.sh` accepts it as `GUARD` (plus `GUARD_RESCUES` / `GUARD_WINDOW` / `GUARD_SCAN`).
+- New `guard/` module (the span predicate + the decision, unit-tested offline) wired into `tools/tqserve.cpp`;
+  `Tokenizer::piece()` added so the text of the special turn-end token can be read (`decode()` drops specials). The
+  server logs each rescue.
 
 **2026-10-20: the prompt cache can resume from the middle of a conversation (§7)**
 

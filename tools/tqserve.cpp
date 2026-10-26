@@ -9,6 +9,7 @@
 #include "src/flags_gen.hpp"
 #include "src/formats/kv_format.hpp"
 #include "src/kv_store.hpp"
+#include "guard/guard.hpp"
 
 #include <cuda_runtime.h>
 
@@ -112,7 +113,7 @@ int bind_socket(const std::string & host, uint16_t port) {
 }
 
 void usage() {
-    std::cerr << "usage: tqserve (--model-dir DIR | --model FILE [--tokenizer FILE]) [--host IPv4] [--port N] [--context N] [--max-tokens N] [--reasoning on|off] [--reasoning-effort low|medium|xhigh] [--reasoning-budget N (-1 unlimited, 0 end now; alias --thinking-budget)] [--reasoning-budget-message TEXT] [--reasoning-answer-reserve N (default 8192; 0 = llama.cpp: budget counts inside max_tokens)] [--jinja (default) | --no-jinja] [--chat-template-file FILE] [--chat-template-kwargs JSON] [--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]] "
+    std::cerr << "usage: tqserve (--model-dir DIR | --model FILE [--tokenizer FILE]) [--host IPv4] [--port N] [--context N] [--max-tokens N] [--reasoning on|off] [--reasoning-effort low|medium|xhigh] [--reasoning-budget N (-1 unlimited, 0 end now; alias --thinking-budget)] [--reasoning-budget-message TEXT] [--reasoning-answer-reserve N (default 8192; 0 = llama.cpp: budget counts inside max_tokens)] [--guard on|off] [--guard-rescues N] [--guard-window N] [--guard-scan N] [--jinja (default) | --no-jinja] [--chat-template-file FILE] [--chat-template-kwargs JSON] [--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]] "
                  "[--system TEXT] [--name NAME] [--api-key KEY | --api-key-file FILE] [--np N] [--draft-max N (default: DFlash2 7, DSpark 3)] "
                  "[--repeat-limit N (default 256, 0 off)] [--list-kv] [--list-flags]\n"
               << tqllm::engine_options_usage()
@@ -150,6 +151,10 @@ int main(int argc, char ** argv) {
     int32_t thinking_budget = -1;  // default reasoning budget (llama.cpp --reasoning-budget): -1 unlimited, 0 end immediately, N tokens
     std::string budget_message;    // text forced before the end-of-thinking tag when the budget runs out (default none)
     uint32_t answer_reserve = 8192;  // with a thinking budget, max_tokens is raised to at least budget + this, so the answer is not cut off
+    bool guard_on = false;        // --guard on|off: control-span + close-thinking rescue (strata-guard port)
+    int  guard_rescues = 5;       // --guard-rescues N: hard bound on rescues per request
+    int  guard_window = 32;       // --guard-window N: characters inspected at the end of the reply (rules 1-3)
+    int  guard_scan = 0;          // --guard-scan N: characters scanned for an open code span/block; 0 = the whole turn
     uint32_t port = 8086, context = 2048, max_tokens = 512, np = 1;
     std::string mmproj;
     bool use_jinja = true;  // llama.cpp default: render the prompt with the model's Jinja chat template; --no-jinja = native Qwen layout
@@ -198,6 +203,14 @@ int main(int argc, char ** argv) {
             }
             else if (arg == "--reasoning-budget-message") budget_message = value();
             else if (arg == "--reasoning-answer-reserve") answer_reserve = static_cast<uint32_t>(std::stoul(value()));
+            else if (arg == "--guard") {
+                const std::string setting = value();
+                if (setting != "on" && setting != "off") throw std::invalid_argument("--guard must be on or off");
+                guard_on = setting == "on";
+            }
+            else if (arg == "--guard-rescues") guard_rescues = std::stoi(value());
+            else if (arg == "--guard-window") guard_window = std::stoi(value());
+            else if (arg == "--guard-scan") guard_scan = std::stoi(value());
             else if (arg == "--jinja") use_jinja = true;
             else if (arg == "--no-jinja") use_jinja = false;
             else if (arg == "--chat-template-file") template_file = value();
@@ -309,6 +322,10 @@ int main(int argc, char ** argv) {
                   << ", context=" << slot_context << (np > 1 ? " per slot, slots=" + std::to_string(np) : std::string())
                   << ")\n";
 
+        const std::string eos_marker = guard_on ? tokenizer.piece(tokenizer.eos_id()) : std::string();
+        if (guard_on)
+            std::cerr << "tqserve: guard ENABLED (window " << guard_window << ", scan " << guard_scan
+                      << ", max rescues " << guard_rescues << ", eos marker " << eos_marker.size() << " bytes)\n";
         while (running) {
             if (!scheduler && model.kv_idle_pending()) {  // idle: compact one old block, unless a client is waiting
                 pollfd pf{listener, POLLIN, 0};
@@ -449,9 +466,58 @@ int main(int argc, char ** argv) {
                         }
                     } else {
                         tqserve::StreamWriter out(tokenizer, parsed, name, send);
-                        const auto generated = run_stream(parsed, out);
+                        auto generated = run_stream(parsed, out);
                         if (!generated.error.empty()) out.error(generated.error);
-                        else out.close(generated);
+                        else if (!guard_on) out.close(generated);
+                        else {
+                            tqguard::Guard guard(guard_rescues, guard_window, guard_scan);
+                            tqserve::StreamWriter * final_writer = &out;
+                            tqserve::DecodeResult final_result = generated;
+                            for (;;) {
+                                auto d = guard.decide(generated.reasoning, generated.text, generated.finish_reason,
+                                                      tqguard::thinking_open(generated.reasoning, generated.text),
+                                                      eos_marker, parsed.thinking);
+                                if (d.kind == tqguard::Decision::None) break;
+                                std::cerr << "tqserve: guard rescue " << (d.kind == tqguard::Decision::CloseThinking ? "close-thinking" : "escape-stop") << " (rescues used " << guard.rescues() << ")\n";
+
+                                auto cont = parsed;
+                                cont.thinking = false;
+                                cont.max_tokens = parsed.max_tokens - std::min(parsed.max_tokens, generated.completion_tokens);
+                                if (cont.max_tokens <= 0) break;
+                                cont.prompt_text += (d.kind == tqguard::Decision::CloseThinking)
+                                    ? d.append
+                                    : (generated.reasoning + generated.text + d.append);
+                                final_writer->flush(generated);
+                                tqserve::StreamWriter cw(tokenizer, cont, name, send);
+                                cw.mark_role_sent();
+                                auto more = run_stream(cont, cw);
+                                if (!more.error.empty()) {
+                                    generated.error = more.error;
+                                    final_writer = &cw;
+                                    final_result = more;
+                                    break;
+                                }
+                                generated.text = (d.kind == tqguard::Decision::CloseThinking ? std::string() : generated.text) + more.text;
+                                generated.tool_calls = more.tool_calls;
+                                generated.completion_tokens += more.completion_tokens;
+                                generated.prefill_ms += more.prefill_ms;
+                                generated.decode_ms += more.decode_ms;
+                                generated.draft_n += more.draft_n;
+                                generated.draft_accepted += more.draft_accepted;
+                                generated.finish_reason = more.finish_reason;
+                                final_writer = &cw;
+                                final_result = more;
+                                final_result.tool_calls = generated.tool_calls;
+                                final_result.completion_tokens = generated.completion_tokens;
+                                final_result.prompt_tokens = generated.prompt_tokens;
+                                final_result.prefill_ms = generated.prefill_ms;
+                                final_result.decode_ms = generated.decode_ms;
+                                final_result.draft_n = generated.draft_n;
+                                final_result.draft_accepted = generated.draft_accepted;
+                            }
+                            if (!generated.error.empty()) final_writer->error(generated.error);
+                            else final_writer->close(final_result);
+                        }
                     }
                     ::close(client);
                     return;
@@ -489,6 +555,34 @@ int main(int argc, char ** argv) {
                         }
                     } else {
                         generated = run(parsed);
+                    }
+                    if (guard_on && generated.error.empty()) {
+                        tqguard::Guard guard(guard_rescues, guard_window, guard_scan);
+                        for (;;) {
+                            auto d = guard.decide(generated.reasoning, generated.text, generated.finish_reason,
+                                                  tqguard::thinking_open(generated.reasoning, generated.text),
+                                                  eos_marker, parsed.thinking);
+                            if (d.kind == tqguard::Decision::None) break;
+                            std::cerr << "tqserve: guard rescue " << (d.kind == tqguard::Decision::CloseThinking ? "close-thinking" : "escape-stop") << " (rescues used " << guard.rescues() << ")\n";
+
+                            auto cont = parsed;
+                            cont.thinking = false;
+                            cont.max_tokens = parsed.max_tokens - std::min(parsed.max_tokens, generated.completion_tokens);
+                            if (cont.max_tokens <= 0) break;
+                            cont.prompt_text += (d.kind == tqguard::Decision::CloseThinking)
+                                ? d.append
+                                : (generated.reasoning + generated.text + d.append);
+                            auto more = run(cont);
+                            if (!more.error.empty()) { generated.error = more.error; break; }
+                            generated.text = (d.kind == tqguard::Decision::CloseThinking ? std::string() : generated.text) + more.text;
+                            generated.tool_calls = more.tool_calls;
+                            generated.completion_tokens += more.completion_tokens;
+                            generated.prefill_ms += more.prefill_ms;
+                            generated.decode_ms += more.decode_ms;
+                            generated.draft_n += more.draft_n;
+                            generated.draft_accepted += more.draft_accepted;
+                            generated.finish_reason = more.finish_reason;
+                        }
                     }
                     if (!generated.error.empty()) {
                         status = generated.error.rfind(kFailed, 0) == 0 ? 500 : 400;

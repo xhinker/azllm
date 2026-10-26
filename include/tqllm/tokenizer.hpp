@@ -11,6 +11,8 @@ public:
     void load(const std::string & path);  // tokenizer.tqtok, or a GGUF model file (its tokenizer.ggml.* metadata)
     std::vector<uint32_t> encode(const std::string & text) const;
     std::string decode(const std::vector<uint32_t> & ids) const;
+    // The text of one token, including special/control tokens (decode() drops those).
+    std::string piece(uint32_t id) const;
     uint32_t eos_id() const { return eos_id_; }
 private:
     std::vector<std::string> id_to_piece_;

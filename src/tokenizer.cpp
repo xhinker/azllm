@@ -171,6 +171,12 @@ std::vector<uint32_t> Tokenizer::encode(const std::string & text) const {
     }
     return ids;
 }
+std::string Tokenizer::piece(uint32_t id) const {
+    if (id < id_to_piece_.size() && !id_to_piece_[id].empty()) return id_to_piece_[id];
+    for (const auto & p : special_to_id_) if (p.second == id) return p.first;
+    return std::string();
+}
+
 std::string Tokenizer::decode(const std::vector<uint32_t> & ids) const {
     std::string out;
     for(uint32_t id:ids){if(id>=id_to_piece_.size()||id_to_piece_[id].empty())continue; const auto & s=id_to_piece_[id]; bool special=false;for(const auto & p:special_to_id_)if(p.first==s){special=true;break;} if(special)continue;
