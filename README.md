@@ -306,7 +306,20 @@ continuation stateful is the open follow-up.
 ### Updates
 
 Newest first. Everything below is serve layer or tooling; the engine, weight formats and sampling stay upstream -
-with two exceptions, 2026-10-20 (§7) and 2026-10-26 (§8).
+with three exceptions: 2026-10-20 (§7), 2026-10-26 (§8), and the `top_p` default below.
+
+**2026-10-26: a request that omits `top_p` no longer samples the whole candidate set**
+
+- The serve default is now **0.95**, the Qwen3.8 model card's value for both thinking and non-thinking modes.
+  `--top-p F` sets it (`--top-p 1` restores the old behaviour) and `--top-k N` does the same for `top_k`; a request
+  that sends either field still wins, and greedy requests (temperature 0) never reach the nucleus step, so they are
+  unaffected. `Request::top_p` / `top_k` now initialise from `ServeOptions` instead of hardcoding 1.0 / 0.
+- Why: the sampler scores 16 candidates, so `top_k` was already tighter than the card's 20 and `min_p` does not
+  exist here - `top_p` was the only card value the server ignored. The symptom this targets is repetition inside
+  long thinking blocks; the card and the community reports on Qwen3.8-27B point at a loose nucleus together with a
+  low `reasoning_effort`, and both say penalties make thinking worse, not better. Nothing here adds a penalty.
+- This is the third exception to the sentence above. It changes behaviour for clients that send `temperature`
+  without `top_p`; upstream is untouched, so a merge keeps working, but the default is a fork choice now.
 
 **2026-10-26: a guard that rescues a reply that stopped mid-span (§8)**
 
@@ -589,6 +602,8 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 | `--api-key KEY` / `--api-key-file FILE` | | require a bearer key |
 | `--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]` | 8, 4096 | vision projector for image input |
 | `--repeat-limit N` | 256 | end a request after N identical tokens in a row (0 off) |
+| `--top-p F` | 0.95 | default nucleus over the scored candidates, for requests that omit `top_p` (1 = the whole set) |
+| `--top-k N` | 0 | default `top_k` for requests that omit it (0 = all candidates the model scores; see Sampling numbers) |
 
 ### Reasoning and chat template
 
@@ -736,7 +751,11 @@ retain their own licenses. tqLLM itself is licensed under Apache-2.0 (see LICENS
 
 ### Request sampling numbers
 
-`top_k` accepts integers from 0 to INT_MAX; sampling currently uses at most 16 candidates.
+`top_p` accepts values in (0, 1]. Omitted or null, a request takes the server's `--top-p` (0.95); a value in the
+request always wins. `top_k` accepts integers from 0 to INT_MAX; sampling currently uses at most 16 candidates, so
+`top_k` above 16 - and the model card's 20 - behaves as 16, and `min_p` is not implemented. Omitted, `top_k` takes
+the server's `--top-k` (0 = all 16). Both fields are inert at `temperature` 0: greedy takes the top candidate
+without reaching the nucleus step.
 `seed` accepts integers from 0 to 9007199254740991 (the JSON parser's exact integer range).
 Negative seeds are rejected with HTTP 400; omitted, null or zero retains the default seed behavior.
 Fractional, out-of-range and nonnumeric values are rejected before integer conversion.
