@@ -15,7 +15,9 @@
 #   MODEL=models/Qwen3.8-27B-TQ_L.gguf TEMPLATE=models/chat_template_v22.jinja ./run_3090.sh
 #                                          any other file; TEMPLATE is required for
 #                                          the TQ_XS/S/M/L builds (unfixed template)
-#
+# Usage sample:
+#   PC_STEP=2048 GUARD=on MODEL=models/Qwen3.8-27B-TQ_L.gguf GPU=2 PORT=8086 TEMPLATE=models/chat_template_v22.jinja ./run_3090.sh
+# 
 # Env: MODEL DRAFTER DRAFT_VOCAB TEMPLATE GPU PORT CONTEXT KV MAX_TOKENS REASONING_BUDGET GUARD [GUARD_RESCUES GUARD_WINDOW GUARD_SCAN]
 # Weights:  python3 get_models.py --type TQ3_4S-v2      Health: curl -s localhost:8086/health
 set -euo pipefail
