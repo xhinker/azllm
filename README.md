@@ -308,6 +308,32 @@ continuation stateful is the open follow-up.
 Newest first. Everything below is serve layer or tooling; the engine, weight formats and sampling stay upstream -
 with three exceptions: 2026-10-20 (§7), 2026-10-26 (§8), and the `top_p` default below.
 
+**2026-10-26: the request values this fork is run with: `temperature` 0, `reasoning_effort` medium**
+
+- Documentation only - no code changed in this entry. What changed is what the client sends: every Qwen3.8-27B
+  profile in the AZ PAL `agent_config.json` now sends `temperature: 0.0` (was 0.5) and, where the effort field is
+  set at all, `reasoning_effort: "medium"` (was `"low"`). Nothing on the server moved: a request that omits
+  `temperature` was already greedy (`Request::temperature` starts at 0), and `--reasoning-effort` is still the
+  default - `xhigh` - for a request that sends no effort.
+- Why the effort first. `low` is where the repeated thinking came from. Measured on a long agent conversation
+  served at low effort, 39.6% of the sentences inside the thinking blocks were duplicates - worst single block 81%,
+  one sentence emitted 53 times - while similarity across turns was 0.01-0.26. The model was cycling inside one
+  block, not copying its history. The card's warning about lower effort ("may cause insufficient analysis, more
+  failures, and repeated retries") describes that shape, and the community reports on Qwen3.8-27B agree. `medium`
+  stops it. `xhigh` is the right answer to a hard single question, not to an agent loop that pays for it on every
+  tool iteration.
+- Why the temperature. 0.5 was a client default that nothing had measured. Greedy is what this server defaults to
+  and what every benchmark row above was taken at, and it takes one sampling variable out of a 200K-token agent
+  conversation. The card's thinking-mode temperature is 0.6, and a long greedy generation has its own repetition
+  risk, so 0.6 with the 0.95 nucleus below is the sampled alternative - what was not defensible was 0.5, which is
+  neither and reaches the nucleus step with a looser cut than the card asks for.
+- The two changes aim at two different causes and neither adds a penalty: effort at the low effort, `top_p` at the
+  loose nucleus. They do not overlap - at `temperature` 0 the sampler is greedy and never reaches the nucleus step,
+  so the 0.95 default only applies to clients that sample.
+- Same field on the other server: llama.cpp parses `reasoning_effort` and binds it into the chat template as
+  `reasoning_effort` / `reasoning_strength` (`common/jinja/caps.cpp`, `tools/server/server-common.cpp`), so one
+  client config is correct against both this server and llama.cpp.
+
 **2026-10-26: a request that omits `top_p` no longer samples the whole candidate set**
 
 - The serve default is now **0.95**, the Qwen3.8 model card's value for both thinking and non-thinking modes.
@@ -559,6 +585,11 @@ No drafter file: `--mtp` drafts with the model's own prediction head (one user, 
   memory first, then shrinks the context, and logs each step. Pass `-fitt N` to keep N MiB of the GPU free (default
   768, 256 on WSL).
 - `REASONING=on` for thinking tasks, with `MAX_TOKENS` large enough for the thinking plus the answer (4096 or more).
+- **In the request: `temperature: 0` and `reasoning_effort: "medium"`.** A request that omits `temperature` is
+  already greedy here, so the only thing to get right is not to override it with 0.5. Do not send
+  `reasoning_effort: "low"` on Qwen3.8-27B - it is the setting that produces thinking that repeats itself (see
+  Updates, 2026-10-26). `--reasoning-effort` only supplies the value for requests that send no effort; a request
+  that sends one always wins.
 - `PARALLEL=N` serves N requests at once; the context is split evenly between them.
 
 ## Long context on a 16 GB card (TqCache)
