@@ -388,6 +388,8 @@ public:
             memlog("drafter");
             calibrate_prefill();
             pc_on = (opt.prompt_cache || kv_cmp) && slots == 1;
+            pc_step = opt.prompt_cache_step > 0 ? uint32_t(opt.prompt_cache_step)
+                      : (opt.prompt_cache_step == 0 ? 0u : 2048u);   // -1: auto
             if (slots > 1 && !fmt_target) throw std::runtime_error("multiple slots need a quantized GGUF model (verify path)");
             parked.resize(size_t(slots));
             for (int s = 1; s < slots; ++s) {  // allocate slot s in the members, then park it; slot 0 stays active
@@ -466,7 +468,7 @@ public:
         const int dk = int(cfg.lin_dk), dv = int(cfg.lin_dv);
         const int qkv_dim = 2 * lkh * dk + lvh * dv, zdim = lvh * dv;
         auto *xp = x.as<bf16>(), *np = norm.as<bf16>(), *rp = resid.as<bf16>(), *mp = mix.as<bf16>();
-        if (pos == 0) reset_state(), pc_drop();  // recurrent layers carry state; a new sequence starts from zero
+        if (pos == 0) { reset_state(); if (!pc_protect) pc_drop(); }  // recurrent layers carry state; a new sequence starts from zero
 
         if (embed.type == GGML_TQ3_4S) tqllm_cuda::tq3_row(embed.p, int(id), xp, H, stream);
         else if (embed.type == GGML_Q6_K) tqllm_cuda::q6k_row(embed.p, int(id), xp, H, stream);
@@ -652,15 +654,27 @@ public:
         for (const auto & ck : pc_cks) if (ck.pos <= shared && ck.pos > best && ck.pos < uint32_t(prompt.size())) best = ck.pos;
         return best;
     }
+    // The interval that keeps `pc_keep` snapshots spread across a prompt of P tokens. A fixed 2048 covers a 30K
+    // prompt but only the last 32K of a 200K one, and a divergence below that is still a full re-prefill - so the
+    // grid widens with the prompt and always reaches back to token 0.
+    uint32_t pc_grid(uint32_t P) const {
+        if (!pc_step) return 0;
+        const uint32_t span = (P + pc_keep - 1) / pc_keep;
+        return pc_step > span ? pc_step : span;
+    }
     void pc_ckpt_save(uint32_t pos) {  // one more resumable position, newest `keep` kept
-        if (!pc_cks.size() && opt.prompt_cache_step)
-            std::fprintf(stderr, "tqllm: prompt cache: snapshots of %zu MiB every %d tokens, keeping %zu\n",
-                        (conv_bytes() + rec_bytes()) * (conv_state.size() / NSLOT) >> 20, opt.prompt_cache_step,
+        if (!pc_cks.size() && pc_step)
+            std::fprintf(stderr, "tqllm: prompt cache: snapshots of %zu MiB every %u tokens, keeping %zu\n",
+                        (conv_bytes() + rec_bytes()) * (conv_state.size() / NSLOT) >> 20, pc_step,
                         size_t(pc_keep));
-        if (pc_cks.size() >= pc_keep) pc_cks.erase(pc_cks.begin());  // oldest first
+        if (pc_cks.size() >= pc_keep) {  // hand the evicted pinned buffer to the pool: cudaHostAlloc per save is not free
+            pc_pool.push_back(std::move(pc_cks.front().buf));
+            pc_cks.erase(pc_cks.begin());  // oldest first
+        }
         PcCk ck;
         ck.pos = pos;
-        ck.buf = std::make_unique<HostBuf>((conv_bytes() + rec_bytes()) * (conv_state.size() / NSLOT));
+        if (!pc_pool.empty()) { ck.buf = std::move(pc_pool.back()); pc_pool.pop_back(); }
+        else ck.buf = std::make_unique<HostBuf>((conv_bytes() + rec_bytes()) * (conv_state.size() / NSLOT));
         pc_copy(true, ck.buf->p);
         pc_cks.push_back(std::move(ck));
     }
@@ -756,8 +770,11 @@ private:
     // no copy); positions past the newest kept one are re-prefilled as today.
     struct PcCk { uint32_t pos = 0; std::unique_ptr<HostBuf> buf; };
     std::vector<PcCk> pc_cks;
-    uint32_t pc_keep = 8, pc_next = 0;  // pc_next: the next position to snapshot at
+    uint32_t pc_keep = 16, pc_next = 0, pc_step = 0;   // interval checkpoints + turn boundaries (16 x ~146 MiB host)  // pc_next: where to snapshot next; pc_step: 0 = off
+    std::vector<std::unique_ptr<HostBuf>> pc_pool;     // pinned buffers freed by eviction, reused by the next save
     bool pc_on = false, pc_live = false;
+    bool pc_protect = false;      // this request must not evict the cached conversation
+    uint32_t pc_protect_runs = 0; // consecutive unrelated short requests
     uint32_t last_pc = 0;  // prompt tokens the last request reused from the cache
     // Prefill progress for the serve layer's 3 s heartbeat. Chunks are queued onto one stream far ahead of
     // the GPU, so the loop counter would report queue position, not work done: one event per chunk, and a
@@ -2325,7 +2342,7 @@ public:
 
     void verify_async(const uint32_t * tokens, const int * pos_host, int n, uint32_t pos,
                       uint32_t * next, bool copy_all) {
-        if (pos == 0) reset_state(), pc_drop();
+        if (pos == 0) { reset_state(); if (!pc_protect) pc_drop(); }
         kv_track(pos, n);
         if (!(defer && tree_step && n <= NVER)) flush_pending();
         // every verify-sized block (decode included) goes through the two-part attention when the KV format has it: a tree
@@ -3723,18 +3740,47 @@ public:
         // prompt reuse: positions [0, P0) are already cached; a boundary at snap keeps the state for the next request
         const uint32_t P0 = pc_on && images.empty() ? pc_match(prompt) : 0;
         last_pc = P0;
-        if (P0 < pc_snap) pc_snap = 0;
-        if (!pc_cks.empty()) {  // a snapshot of a token the new prompt does not have cannot be resumed from
-            const uint32_t keep_upto = P0;
-            size_t w = 0;
-            for (size_t i = 0; i < pc_cks.size(); ++i) if (pc_cks[i].pos <= keep_upto) pc_cks[w++] = std::move(pc_cks[i]);
-            pc_cks.resize(w);
+        // A short request that shares nothing with the cached conversation - a title, a health probe,
+        // a one-shot classification - must NOT evict it: pc_seq.assign() below would replace a 100K-token
+        // conversation with a few dozen tokens, and the next real turn would then re-read the whole prompt
+        // (measured: 250 ms / 35 tokens between two 100K turns cost the following turn 107K tokens).
+        // The first such request is served against the cache as-is; a second consecutive unrelated
+        // request means a genuinely new conversation and takes the cache over.
+        pc_protect = pc_on && !pc_seq.empty() && P0 == 0 && P < 4096 && pc_protect_runs == 0;
+        pc_protect_runs = pc_protect ? 1u : 0u;
+        std::fprintf(stderr, "tqllm: prompt cache: %u of %u prompt tokens reused (snap=%u cks=%zu)%s\n",
+                     P0, P, pc_snap, pc_cks.size(),
+                     P0 ? "" : (pc_protect ? "  <- one-shot, conversation cache kept" : "  <- FULL RE-READ"));
+        if (pc_on && !P0 && !pc_seq.empty() && !pc_protect) {  // a full re-read is a rewritten prefix: say where and show it
+            const uint32_t sh = common_prefix(pc_seq, prompt);
+            std::fprintf(stderr, "tqllm: prompt cache: first difference at token %u (cached %zu, this prompt %u)\n",
+                         sh, pc_seq.size(), P);
+            if (sh && sh < P && sh < pc_seq.size()) {
+                const uint32_t b = sh > 24 ? sh - 24 : 0;
+                auto win = [&](const std::vector<uint32_t> & v) {
+                    const uint32_t e = b + 48 < uint32_t(v.size()) ? b + 48 : uint32_t(v.size());
+                    std::string s = tokenizer.decode(std::vector<uint32_t>(v.begin() + b, v.begin() + e));
+                    for (auto & c : s) if (unsigned(c) < 32u || unsigned(c) == 127u) c = ' ';
+                    if (s.size() > 200) s.resize(200);
+                    return s;
+                };
+                std::fprintf(stderr, "tqllm:   cached  >%s<\n", win(pc_seq).c_str());
+                std::fprintf(stderr, "tqllm:   prompt  >%s<\n", win(prompt).c_str());
+            }
         }
-        pc_next = pc_on && opt.prompt_cache_step ? P0 + uint32_t(opt.prompt_cache_step) : 0;
+        if (!pc_protect) {
+            if (P0 < pc_snap) pc_snap = 0;
+            if (!pc_cks.empty()) {  // a snapshot of a token the new prompt does not have cannot be resumed from
+                const uint32_t keep_upto = P0;
+                size_t w = 0;
+                for (size_t i = 0; i < pc_cks.size(); ++i) if (pc_cks[i].pos <= keep_upto) pc_cks[w++] = std::move(pc_cks[i]);
+                pc_cks.resize(w);
+            }
+        }
+        pc_next = pc_on && !pc_protect && pc_step ? P0 + pc_grid(P) : 0;
         pc_live = false;
-        const uint32_t snap = pc_on && P >= P0 + 2 * kTail ? P - kTail : 0;
-        if (pc_on) pc_seq.assign(prompt.begin(), prompt.end());
-        if (P0) std::fprintf(stderr, "tqllm: prompt cache: %u of %u prompt tokens reused\n", P0, P);
+        const uint32_t snap = pc_on && !pc_protect && P >= P0 + 2 * kTail ? P - kTail : 0;
+        if (pc_on && !pc_protect) pc_seq.assign(prompt.begin(), prompt.end());
         if (kv_cmp && opt.kv_compact_turn && cmp_pos) cmp_reset();  // --kv-compact-at turn: the new tokens see exact KV
         // Queue prefill chunks on one stream and read back only the final next token.
         uint32_t next = 0;
@@ -3797,7 +3843,7 @@ public:
                     if (t + uint32_t(m) == snap) pc_copy(true), pc_snap = snap;
                     if (pc_next && t + uint32_t(m) >= pc_next) {  // first boundary at or past the target
                         pc_ckpt_save(t + uint32_t(m));
-                        pc_next = t + uint32_t(m) + uint32_t(opt.prompt_cache_step);
+                        pc_next = t + uint32_t(m) + pc_grid(P);
                     }
                     if (show_progress && (final || (t + uint32_t(m)) % 8192 < uint32_t(m))) {
                         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
@@ -3834,6 +3880,13 @@ public:
             }
             last_prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count();
         }
+
+        // Turn-boundary checkpoint: the next request re-renders THIS turn's answer, and with
+        // preserve_thinking=false it drops the thinking, so the first divergence is exactly at P - the
+        // end of the prompt we just processed. A checkpoint here lets the next turn resume at P and
+        // reuse the whole prompt, instead of falling back to the one snapshot at P-64 (which sits
+        // inside the re-rendered region and is therefore useless) and re-reading everything.
+        if (pc_on && !pc_protect && P > 0) pc_ckpt_save(P);
         gen = Gen{};
         gen.out.assign(1, next);
         if (opt.lookup) gen.hist.assign(prompt.begin(), prompt.end());
