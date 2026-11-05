@@ -3751,7 +3751,9 @@ public:
         std::fprintf(stderr, "tqllm: prompt cache: %u of %u prompt tokens reused (snap=%u cks=%zu)%s\n",
                      P0, P, pc_snap, pc_cks.size(),
                      P0 ? "" : (pc_protect ? "  <- one-shot, conversation cache kept" : "  <- FULL RE-READ"));
-        if (pc_on && !P0 && !pc_seq.empty() && !pc_protect) {  // a full re-read is a rewritten prefix: say where and show it
+        // Fire whenever the deep restore point was lost, not only on a total miss: a request that resumes at a
+        // bookmark below the snapshot is a rewritten history too, just a partially paid one.
+        if (pc_on && !pc_seq.empty() && !pc_protect && P0 < pc_snap) {
             const uint32_t sh = common_prefix(pc_seq, prompt);
             std::fprintf(stderr, "tqllm: prompt cache: first difference at token %u (cached %zu, this prompt %u)\n",
                          sh, pc_seq.size(), P);
