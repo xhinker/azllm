@@ -319,6 +319,19 @@ continuation stateful is the open follow-up.
 Newest first. Everything below is serve layer or tooling; the engine, weight formats and sampling stay upstream -
 with three exceptions: 2026-10-20 (§7), 2026-10-26 (§8), and the `top_p` default below.
 
+**2026-11-05: the prompt-cache bookmarks are on by default, and they span the prompt (§7)**
+
+- `--prompt-cache-step` now defaults to auto - 2048 tokens, widened to `ceil(P / 16)` for a P-token prompt - instead
+  of off. The flag had been added in October but nothing passed it, so the one-slot cache still held only the turn
+  boundary and the tail snapshot, and any history edit before those cost a full re-prefill.
+- The bookmarks a zero-reuse request used to lose are now there to resume from: the old `keep_upto = P0` prune wiped
+  them, which is why one bad turn made the following turn pay it too.
+- Bookmark host buffers are recycled through a free list rather than re-pinned per save.
+- A full re-read prints `first difference at token N` plus the decoded text on both sides, so the client-side rewrite
+  that broke the shared prefix can be identified instead of inferred.
+- Measured on the 5090 with the 27B at 262K context: an ordinary turn is unchanged at `5609 of 5713`; a sentence
+  rewritten in the middle of the system prompt went from `0 of 5750` to `2048 of 5750`.
+
 **2026-10-26: the request values this fork is run with: `temperature` 0, `reasoning_effort` medium**
 
 - Documentation only - no code changed in this entry. What changed is what the client sends: every Qwen3.8-27B
@@ -367,19 +380,6 @@ with three exceptions: 2026-10-20 (§7), 2026-10-26 (§8), and the `top_p` defau
 - New `guard/` module (the span predicate + the decision, unit-tested offline) wired into `tools/tqserve.cpp`;
   `Tokenizer::piece()` added so the text of the special turn-end token can be read (`decode()` drops specials). The
   server logs each rescue.
-
-**2026-11-05: the prompt-cache bookmarks are on by default, and they span the prompt (§7)**
-
-- `--prompt-cache-step` now defaults to auto - 2048 tokens, widened to `ceil(P / 16)` for a P-token prompt - instead
-  of off. The flag had been added in October but nothing passed it, so the one-slot cache still held only the turn
-  boundary and the tail snapshot, and any history edit before those cost a full re-prefill.
-- The bookmarks a zero-reuse request used to lose are now there to resume from: the old `keep_upto = P0` prune wiped
-  them, which is why one bad turn made the following turn pay it too.
-- Bookmark host buffers are recycled through a free list rather than re-pinned per save.
-- A full re-read prints `first difference at token N` plus the decoded text on both sides, so the client-side rewrite
-  that broke the shared prefix can be identified instead of inferred.
-- Measured on the 5090 with the 27B at 262K context: an ordinary turn is unchanged at `5609 of 5713`; a sentence
-  rewritten in the middle of the system prompt went from `0 of 5750` to `2048 of 5750`.
 
 **2026-10-20: the prompt cache can resume from the middle of a conversation (§7)**
 
