@@ -244,8 +244,8 @@ line shows near-total reuse. Now send that prompt again with one sentence change
 `0 of N` and the prefill runs over everything. Nothing failed; the cache just had nowhere to resume.
 
 **What was added.** `--prompt-cache-step N` writes a bookmark every N prompt tokens while prefilling and keeps the
-last eight. On the next request the engine finds the real shared prefix by binary search and resumes from the deepest
-bookmark at or before it. A bookmark holds the recurrent and short-conv state, which is the part a hybrid model
+newest sixteen. On the next request the engine finds the real shared prefix by binary search and resumes from the
+deepest bookmark at or before it. A bookmark holds the recurrent and short-conv state, which is the part a hybrid model
 cannot recover from nothing; the per-token KV of the attention layers is already in the pool and needs no copy. The
 server prints the size of one bookmark the first time it writes one.
 
@@ -254,11 +254,22 @@ wherever it happens to stop. The gated-deltanet layers keep a running summary, s
 exists if somebody saved it. Without bookmarks, knowing exactly where the two prompts diverge tells you nothing you
 can act on.
 
-| The next prompt | Before | With `--prompt-cache-step 16384` |
+**2026-11-05: the bookmarks are on by default, and the grid spans the prompt.** The flag existed, but it defaulted to
+off and the launch line never passed it, so in practice the cache still had only the two resume points above: the turn
+boundary and the tail snapshot 64 tokens before the end. One edit anywhere earlier cost the whole conversation, and the
+prune that follows a zero-reuse request (`keep_upto = P0`) then deleted the bookmarks that were left, so the next turn
+paid the same price. Now the step defaults to **auto**: 2048 tokens, widened to `ceil(P / 16)` for a prompt of P
+tokens, so the sixteen kept bookmarks always reach back to token 0 - a fixed 2048 covers a 30K prompt but only the
+last 32K of a 200K one. Bookmark buffers are recycled from a free list instead of being re-pinned per save
+(146 MiB of `cudaHostAlloc` per bookmark is not free); worst case 16 x 146 MiB = 2.3 GiB of host RAM. And a full
+re-read finally says why: `first difference at token N`, with the text from both sides of the divergence, so the client
+edit that broke the prefix is named rather than guessed at. `--prompt-cache-step 0` restores the old behaviour.
+
+| The next prompt | Before | With bookmarks on (the default now) |
 |---|---|---|
 | Adds to the end (every ordinary turn) | reuses everything | same path, same speed |
 | Re-renders only the previous answer | reuses up to the tail snapshot | unchanged |
-| Changes something in the middle (a trimmed tool result) | nothing reused, whole conversation re-read | re-reads at most one step, plus the changed tail |
+| Changes something in the middle (a trimmed tool result) | nothing reused, whole conversation re-read | re-reads at most one step, plus the changed tail (measured: `0 of 5750` became `2048 of 5750`) |
 | Replaces the oldest turns with a summary | nothing reused | still nothing: the change is at the head, so no bookmark sits before it |
 
 Off by default, and passing nothing leaves the code path untouched. Through the launch script:
@@ -356,6 +367,19 @@ with three exceptions: 2026-10-20 (§7), 2026-10-26 (§8), and the `top_p` defau
 - New `guard/` module (the span predicate + the decision, unit-tested offline) wired into `tools/tqserve.cpp`;
   `Tokenizer::piece()` added so the text of the special turn-end token can be read (`decode()` drops specials). The
   server logs each rescue.
+
+**2026-11-05: the prompt-cache bookmarks are on by default, and they span the prompt (§7)**
+
+- `--prompt-cache-step` now defaults to auto - 2048 tokens, widened to `ceil(P / 16)` for a P-token prompt - instead
+  of off. The flag had been added in October but nothing passed it, so the one-slot cache still held only the turn
+  boundary and the tail snapshot, and any history edit before those cost a full re-prefill.
+- The bookmarks a zero-reuse request used to lose are now there to resume from: the old `keep_upto = P0` prune wiped
+  them, which is why one bad turn made the following turn pay it too.
+- Bookmark host buffers are recycled through a free list rather than re-pinned per save.
+- A full re-read prints `first difference at token N` plus the decoded text on both sides, so the client-side rewrite
+  that broke the shared prefix can be identified instead of inferred.
+- Measured on the 5090 with the 27B at 262K context: an ordinary turn is unchanged at `5609 of 5713`; a sentence
+  rewritten in the middle of the system prompt went from `0 of 5750` to `2048 of 5750`.
 
 **2026-10-20: the prompt cache can resume from the middle of a conversation (§7)**
 
@@ -668,7 +692,7 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 | `--kv-stage on\|off` | on | stream the RAM part back to the GPU layer by layer while decoding |
 | `--kv-compact R [--kv-compact-at idle\|turn]` | off, idle | compress old KV R-fold (not exact; one slot, tq3 or trellis KV) |
 | `--prompt-cache on\|off` | off | keep the previous turn's KV so a follow-up does not re-read the document (one slot; on with `--kv-compact`) |
-| `--prompt-cache-step N` | off | with `--prompt-cache`: bookmark the state every N prompt tokens so a prompt that differs mid-history resumes from the nearest bookmark instead of reading everything again (§7) |
+| `--prompt-cache-step N` | auto | with `--prompt-cache`: bookmark the state every N prompt tokens so a prompt that differs mid-history resumes from the nearest bookmark instead of reading everything again (§7). Auto is 2048, widened to `ceil(P/16)` so the bookmarks span the prompt; `0` turns bookmarking off |
 | `--kv-store flat` | flat | KV storage policy (only flat is served today) |
 | `--rope-scaling none\|linear\|yarn --rope-scale F [--yarn-orig-ctx N]` | none | context past the trained length (llama.cpp names) |
 
