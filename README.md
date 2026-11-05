@@ -331,6 +331,11 @@ with three exceptions: 2026-10-20 (§7), 2026-10-26 (§8), and the `top_p` defau
   that broke the shared prefix can be identified instead of inferred.
 - Measured on the 5090 with the 27B at 262K context: an ordinary turn is unchanged at `5609 of 5713`; a sentence
   rewritten in the middle of the system prompt went from `0 of 5750` to `2048 of 5750`.
+- New `--prompt-cache-probe N` (default 128) replaces the one-shot leniency for unrelated short requests. The old rule
+  spared the first such request and let the second claim the slot, so a client that fires two probes at startup - AZ
+  PAL probes the thinking source and the model capabilities back to back - evicted a 100K-token conversation on the
+  second one. Now any no-overlap request of at most N tokens leaves the conversation, its snapshot and its bookmarks
+  alone, and a real conversation outgrows the threshold on its first turn and takes the cache over as before.
 
 **2026-10-26: the request values this fork is run with: `temperature` 0, `reasoning_effort` medium**
 
@@ -693,6 +698,7 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 | `--kv-compact R [--kv-compact-at idle\|turn]` | off, idle | compress old KV R-fold (not exact; one slot, tq3 or trellis KV) |
 | `--prompt-cache on\|off` | off | keep the previous turn's KV so a follow-up does not re-read the document (one slot; on with `--kv-compact`) |
 | `--prompt-cache-step N` | auto | with `--prompt-cache`: bookmark the state every N prompt tokens so a prompt that differs mid-history resumes from the nearest bookmark instead of reading everything again (§7). Auto is 2048, widened to `ceil(P/16)` so the bookmarks span the prompt; `0` turns bookmarking off |
+| `--prompt-cache-probe N` | 128 | with `--prompt-cache`: a request of at most N prompt tokens that shares no prefix with the cached conversation is treated as a probe - a health check, a thinking-source probe, a token count - and is answered without evicting that conversation; `0` turns this off (§7) |
 | `--kv-store flat` | flat | KV storage policy (only flat is served today) |
 | `--rope-scaling none\|linear\|yarn --rope-scale F [--yarn-orig-ctx N]` | none | context past the trained length (llama.cpp names) |
 

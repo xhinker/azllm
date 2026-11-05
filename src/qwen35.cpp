@@ -390,6 +390,7 @@ public:
             pc_on = (opt.prompt_cache || kv_cmp) && slots == 1;
             pc_step = opt.prompt_cache_step > 0 ? uint32_t(opt.prompt_cache_step)
                       : (opt.prompt_cache_step == 0 ? 0u : 2048u);   // -1: auto
+            pc_probe = opt.prompt_cache_probe > 0 ? uint32_t(opt.prompt_cache_probe) : 0u;
             if (slots > 1 && !fmt_target) throw std::runtime_error("multiple slots need a quantized GGUF model (verify path)");
             parked.resize(size_t(slots));
             for (int s = 1; s < slots; ++s) {  // allocate slot s in the members, then park it; slot 0 stays active
@@ -774,7 +775,7 @@ private:
     std::vector<std::unique_ptr<HostBuf>> pc_pool;     // pinned buffers freed by eviction, reused by the next save
     bool pc_on = false, pc_live = false;
     bool pc_protect = false;      // this request must not evict the cached conversation
-    uint32_t pc_protect_runs = 0; // consecutive unrelated short requests
+    uint32_t pc_probe = 128;      // --prompt-cache-probe N: a no-overlap request of at most N tokens is a probe
     uint32_t last_pc = 0;  // prompt tokens the last request reused from the cache
     // Prefill progress for the serve layer's 3 s heartbeat. Chunks are queued onto one stream far ahead of
     // the GPU, so the loop counter would report queue position, not work done: one event per chunk, and a
@@ -3740,17 +3741,19 @@ public:
         // prompt reuse: positions [0, P0) are already cached; a boundary at snap keeps the state for the next request
         const uint32_t P0 = pc_on && images.empty() ? pc_match(prompt) : 0;
         last_pc = P0;
-        // A short request that shares nothing with the cached conversation - a title, a health probe,
-        // a one-shot classification - must NOT evict it: pc_seq.assign() below would replace a 100K-token
-        // conversation with a few dozen tokens, and the next real turn would then re-read the whole prompt
-        // (measured: 250 ms / 35 tokens between two 100K turns cost the following turn 107K tokens).
-        // The first such request is served against the cache as-is; a second consecutive unrelated
-        // request means a genuinely new conversation and takes the cache over.
-        pc_protect = pc_on && !pc_seq.empty() && P0 == 0 && P < 4096 && pc_protect_runs == 0;
-        pc_protect_runs = pc_protect ? 1u : 0u;
+        // A request that shares nothing with the cached conversation - a title, a health probe, a one-shot
+        // classification - must NOT evict it: pc_seq.assign() below would replace a 100K-token conversation with a
+        // few dozen tokens, and the next real turn would then re-read the whole prompt (measured: 250 ms / 35 tokens
+        // between two 100K turns cost the following turn 107K tokens). Any no-overlap request at or under
+        // --prompt-cache-probe tokens is treated as such a probe: it runs against the model but leaves pc_seq, the
+        // snapshot and the bookmarks alone. A real conversation outgrows the threshold on its first turn and takes the
+        // cache over normally. The rule used to be one-shot - spare the first unrelated request, let the second claim
+        // the slot - which a client that fires two probes at startup defeats: AZ PAL probes the thinking source and the
+        // model capabilities back to back, and the second probe evicted the conversation. 0 turns the leniency off.
+        pc_protect = pc_on && !pc_seq.empty() && P0 == 0 && pc_probe && P <= pc_probe;
         std::fprintf(stderr, "tqllm: prompt cache: %u of %u prompt tokens reused (snap=%u cks=%zu)%s\n",
                      P0, P, pc_snap, pc_cks.size(),
-                     P0 ? "" : (pc_protect ? "  <- one-shot, conversation cache kept" : "  <- FULL RE-READ"));
+                     P0 ? "" : (pc_protect ? "  <- probe, conversation cache kept" : "  <- FULL RE-READ"));
         // Fire whenever the deep restore point was lost, not only on a total miss: a request that resumes at a
         // bookmark below the snapshot is a rewritten history too, just a partially paid one.
         if (pc_on && !pc_seq.empty() && !pc_protect && P0 < pc_snap) {

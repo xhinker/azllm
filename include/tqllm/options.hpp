@@ -25,6 +25,9 @@ struct EngineOptions {
                                  // new prompt that diverges mid-history resumes from the last snapshot before the
                                  // divergence instead of re-prefilling everything. -1: auto (2048 tokens, widened so the
                                  // kept snapshots span the whole prompt); 0: off (tail snapshot only, the old default).
+    int prompt_cache_probe = 128;  // --prompt-cache-probe N: a request of at most N prompt tokens that shares no prefix
+                                   // with the cached conversation is a probe (health check, thinking-source probe, token
+                                   // count) and is answered without evicting that conversation. 0: no probe leniency.
     bool kv_stage = true;  // --kv-stage on|off: with --kv-host, old positions move to host and are staged back per layer at
                            // link speed (one slot, compressed KV); off: the newest positions stay in host memory
     long kv_host = -1;  // --kv-host N: last N positions of each sequence's KV in host memory (read over PCIe); -1: the fit
