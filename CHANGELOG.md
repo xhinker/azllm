@@ -15,6 +15,11 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   to the server (`ANTHROPIC_BASE_URL`). `tqllm launch codex` / `claude` now point the agent at the server directly.
 
 ### Changed
+- DFlash2 at temperature > 0 draws each draft token from the candidate selector's softmax(score / T) and verifies with
+  rejection sampling (accept min(1, p / q), else resample from max(0, p - q)) instead of proposing the greedy chain,
+  which was accepted with p(d). Still an exact sample of the target. Qwen3.8-27B TQ_L-GPTQ, RTX 4090, T 1.0 /
+  top-p 0.95 / top-k 20, 100 prompts: mean acceptance length 3.95 -> 4.48, single-request decode 187 -> 212 tok/s;
+  same results with 1 and 2 slots. Greedy requests are unchanged. `TQLLM_DFLASH_SAMPLE=0` restores the old proposal.
 - `tqllm launch`: a model given as a file that matches a catalog model also gets that model's DFlash2 drafter, downloaded automatically if missing (`--no-drafter` to opt out).
 - CI: a `vX.Y.Z` tag publishes `X.Y.Z`, `X.Y.Z-cu13` and `latest` to ghcr.io and Docker Hub (no `beta-` tags).
 - MoE decode runs the shared expert inside the routed expert launches. MiniCPM-V 4.7 35B-A3B on one RTX 3090:

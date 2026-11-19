@@ -1888,6 +1888,10 @@ private:
         int rdelta = 0;  // KV position - RoPE position: an image spans nx * ny cells but max(nx, ny) positions
         bool done = true;
         uint64_t steps = 0, drafted = 0, accepted = 0;
+        // TQLLM_DFLASH_SAMPLE=1 with sampling: the last dflash_draft drew its drafts from the selector's softmax(score / T);
+        // q_id / q_p hold each draft's 16-candidate proposal so accept() can run rejection sampling against it
+        std::vector<uint32_t> q_id;
+        std::vector<double> q_p;
         double t_draft = 0, t_verify = 0, t_tail = 0, prefill_ms = 0;
         std::chrono::steady_clock::time_point decode_start;
     } gen;
@@ -3318,11 +3322,30 @@ public:
         }
     }
 
+    // Sampled DFlash2 drafts for sampling requests (default; TQLLM_DFLASH_SAMPLE=0 drafts the greedy chain instead): each
+    // position draws from softmax(selector score / T) over its 16 candidates and the verify runs rejection sampling
+    // against that proposal (accept min(1, p / q), else resample from max(0, p - q)), as SGLang's DFlash path does. Both
+    // are exact samples of the target; the sampled proposal is accepted far more often at T = 1.
+    static bool sample_drafts() {
+        static const bool on = [] { const char * e = std::getenv("TQLLM_DFLASH_SAMPLE"); return !(e && *e == '0'); }();
+        return on;
+    }
+    // Batched sampled drafts: per-request proposals [rq][block - 1][16] (bq_*: the host walk's, or the device chain's
+    // read back with the verify results).
+    Buf d_qu, d_qid, d_qp;
+    size_t dq_cap = 0;
+    std::vector<uint32_t> bq_id;
+    std::vector<float> bq_p;
+
     // One DFlash2 block [anchor, MASK x (block-1)] at positions pos..; returns up to block-1 greedy drafts.
     // Drafts for several slots in one pass over the drafter weights (block of B rows per slot); the position-dependent
     // pieces (RoPE, K/V write, attention, the block's causal conv, lattice) run per slot. Needs the K/V ring and a
     // 4-bit draft head; otherwise empty (callers draft per slot).
-    struct DraftReq { int slot; uint32_t anchor, pos; int want; };
+    struct DraftReq {
+        int slot; uint32_t anchor, pos; int want;
+        float temp = 0.f;      // > 0: sampled drafts (softmax(score / temp) per position), else the greedy chain
+        std::vector<float> u;  // the slot's uniforms in [0, 1) for the sampled picks (block - 1)
+    };
     // tree_cols: instead of chain drafts on the host, build each slot's token tree on the device (dflash_tree) into
     // v_tokens / d_tpar / d_tdep at column tree_cols[i] with rq[i].want nodes; no host sync
     // chain_cols: the same for the greedy chain (min(want, block - 1) tokens at column chain_cols[i] + 1); no host sync
@@ -3437,11 +3460,31 @@ public:
             }
             return true;
         }
+        const size_t qrow = size_t(B - 1) * 16;  // one request's proposal block
+        bool any_q = false;
+        for (const auto & r : rq) any_q |= r.temp > 0.f;
         if (chain_cols) {
-            for (int i = 0; i < ns; ++i)
-                tqllm_cuda::dflash_chain(d_idx.as<uint32_t>() + size_t(i) * B * 16, d_score.as<float>() + size_t(i) * B * 256,
-                                         std::min(rq[size_t(i)].want, B - 1),
-                                         v_tokens.as<uint32_t>() + (*chain_cols)[size_t(i)] + 1, stream);
+            if (any_q) {
+                if (dq_cap < size_t(ns)) {
+                    dq_cap = size_t(ns);
+                    d_qu = Buf(dq_cap * B * 4);
+                    d_qid = Buf(dq_cap * qrow * 4);
+                    d_qp = Buf(dq_cap * qrow * 4);
+                }
+                std::vector<float> u(size_t(ns) * B, 0.f);
+                for (int i = 0; i < ns; ++i)
+                    std::copy(rq[size_t(i)].u.begin(), rq[size_t(i)].u.end(), u.begin() + size_t(i) * B);
+                ck(cudaMemcpyAsync(d_qu.p, u.data(), u.size() * 4, cudaMemcpyHostToDevice, stream));  // pageable: staged
+            }
+            for (int i = 0; i < ns; ++i) {
+                const bool q = rq[size_t(i)].temp > 0.f;
+                tqllm_cuda::dflash_chain_sample(d_idx.as<uint32_t>() + size_t(i) * B * 16,
+                                                d_score.as<float>() + size_t(i) * B * 256, std::min(rq[size_t(i)].want, B - 1),
+                                                rq[size_t(i)].temp, q ? d_qu.as<float>() + size_t(i) * B : nullptr,
+                                                v_tokens.as<uint32_t>() + (*chain_cols)[size_t(i)] + 1,
+                                                q ? d_qid.as<uint32_t>() + size_t(i) * qrow : nullptr,
+                                                q ? d_qp.as<float>() + size_t(i) * qrow : nullptr, stream);
+            }
             return true;
         }
         std::vector<uint32_t> idx(size_t(DB) * 16);
@@ -3450,12 +3493,29 @@ public:
         ck(cudaMemcpyAsync(score.data(), d_score.p, score.size() * 4, cudaMemcpyDeviceToHost, stream));
         sync_ck();
         out.assign(size_t(ns), {});
+        bq_id.assign(any_q ? size_t(ns) * qrow : 0, 0u);
+        bq_p.assign(any_q ? size_t(ns) * qrow : 0, 0.f);
         for (int s2 = 0; s2 < ns; ++s2) {
             int pred = 0;
             const size_t o = size_t(s2) * B;
-            for (int i = 1; i < B && int(out[size_t(s2)].size()) < rq[size_t(s2)].want; ++i) {
+            const auto & r = rq[size_t(s2)];
+            for (int i = 1; i < B && int(out[size_t(s2)].size()) < r.want; ++i) {
                 const float * row = score.data() + ((o + i) * 16 + pred) * 16;
-                pred = int(std::max_element(row, row + 16) - row);
+                if (r.temp > 0.f) {  // the same draw as dflash_chain_sample
+                    const float mx = *std::max_element(row, row + 16);
+                    float q[16], sum = 0.f;
+                    for (int k = 0; k < 16; ++k) sum += q[k] = std::exp((row[k] - mx) / r.temp);
+                    float x = r.u[size_t(i - 1)] * sum;
+                    pred = 15;
+                    for (int k = 0; k < 16; ++k)
+                        if ((x -= q[k]) <= 0.f) { pred = k; break; }
+                    for (int k = 0; k < 16; ++k) {
+                        bq_id[size_t(s2) * qrow + size_t(i - 1) * 16 + k] = idx[(o + i) * 16 + k];
+                        bq_p[size_t(s2) * qrow + size_t(i - 1) * 16 + k] = q[k] / sum;
+                    }
+                } else {
+                    pred = int(std::max_element(row, row + 16) - row);
+                }
                 out[size_t(s2)].push_back(idx[(o + i) * 16 + pred]);
             }
         }
@@ -3662,10 +3722,27 @@ public:
         ck(cudaMemcpyAsync(score.data(), d_score.p, score.size() * 4, cudaMemcpyDeviceToHost, stream));
         sync_ck();
         std::vector<uint32_t> out;
+        const bool draw_q = sample_drafts() && sampling();
+        gen.q_id.clear();
+        gen.q_p.clear();
         int pred = 0;
         for (int i = 1; i < B && int(out.size()) < want; ++i) {
             const float * row = score.data() + (size_t(i) * 16 + pred) * 16;
-            pred = int(std::max_element(row, row + 16) - row);
+            if (draw_q) {  // proposal q = softmax(row / T) over this position's 16 candidates, given the previous pick
+                const float mx = *std::max_element(row, row + 16);
+                double q[16], s = 0;
+                for (int c = 0; c < 16; ++c) s += q[c] = std::exp(double(row[c] - mx) / samp.temperature);
+                double u = std::uniform_real_distribution<double>(0.0, s)(rng);
+                pred = 15;
+                for (int c = 0; c < 16; ++c)
+                    if ((u -= q[c]) <= 0) { pred = c; break; }
+                for (int c = 0; c < 16; ++c) {
+                    gen.q_id.push_back(idx[size_t(i) * 16 + c]);
+                    gen.q_p.push_back(q[c] / s);
+                }
+            } else {
+                pred = int(std::max_element(row, row + 16) - row);
+            }
             out.push_back(idx[size_t(i) * 16 + pred]);
         }
         if (idx_out) *idx_out = std::move(idx);
@@ -3912,7 +3989,28 @@ public:
     // holds the target's prediction after draft token i - 1 (greedy: res[i]; sampling: h_sid / h_slg top-16).
     int accept(const std::vector<uint32_t> & draft, uint32_t * res, int col0) {
         int j = 0;
-        if (sampling()) {  // speculative sampling with a deterministic draft: exact samples of the target's p
+        if (sampling() && !draft.empty() && gen.q_p.size() >= draft.size() * 16) {
+            // sampled drafts (TQLLM_DFLASH_SAMPLE): accept d with min(1, p(d) / q(d)), else draw from norm(max(0, p - q))
+            std::uniform_real_distribution<double> uni(0.0, 1.0);
+            for (; j < int(draft.size()); ++j) {
+                const Dist d = dist(col0 + j);
+                const uint32_t * qi = gen.q_id.data() + size_t(j) * 16;
+                const double * qp = gen.q_p.data() + size_t(j) * 16;
+                auto q_of = [&](uint32_t t) { for (int c = 0; c < 16; ++c) if (qi[c] == t) return qp[c]; return 0.0; };
+                double p = 0;
+                for (int i = 0; i < d.n; ++i) if (d.id[i] == draft[j]) p = d.p[i];
+                const double qd = q_of(draft[j]);
+                if (qd > 0 && uni(rng) * qd < p) continue;
+                Dist r = d;
+                double tot = 0;
+                for (int i = 0; i < r.n; ++i) tot += r.p[i] = std::max(0.0, d.p[i] - q_of(d.id[i]));
+                res[j] = tot > 0 ? draw(r) : draw(d);
+                break;
+            }
+            if (j == int(draft.size())) res[j] = draw(dist(col0 + j));
+            gen.q_id.clear();
+            gen.q_p.clear();
+        } else if (sampling()) {  // speculative sampling with a deterministic draft: exact samples of the target's p
             std::uniform_real_distribution<double> uni(0.0, 1.0);
             for (; j < int(draft.size()); ++j) {
                 const Dist d = dist(col0 + j);
@@ -4077,7 +4175,15 @@ public:
         std::vector<DraftReq> rq;
         for (int i = 0; i < ns; ++i) {
             select_slot(slots[i]);
-            if (!gen.done) rq.push_back({slots[i], gen.pending, gen.pos, std::min(gen.D, per - 1)});
+            if (gen.done) continue;
+            rq.push_back({slots[i], gen.pending, gen.pos, std::min(gen.D, per - 1)});
+            if (sampling() && sample_drafts() && dfl.present && !dfl.dspark) {
+                auto & r = rq.back();
+                r.temp = samp.temperature;
+                std::uniform_real_distribution<float> uni(0.f, 1.f);
+                r.u.resize(size_t(std::max(1, dfl.block - 1)));
+                for (auto & x : r.u) x = uni(rng);
+            }
         }
         if (tree_mode && dfl.present && rq.size() >= 2 && tree_step_batch(rq, slots, ns, done, p0))
             return;
@@ -4137,6 +4243,15 @@ public:
             ck(cudaMemcpyAsync(h_sid.data(), s_id.p, size_t(col) * 16 * 4, cudaMemcpyDeviceToHost, stream));
             ck(cudaMemcpyAsync(h_slg.data(), s_lg.p, size_t(col) * 16 * 4, cudaMemcpyDeviceToHost, stream));
         }
+        const size_t qrow = size_t(std::max(1, dfl.block - 1)) * 16;
+        bool any_q = false;
+        for (const auto & r : rq) any_q |= r.temp > 0.f;
+        if (on_dev && any_q) {  // the device chain's proposals, read back with the verify results
+            bq_id.resize(rq.size() * qrow);
+            bq_p.resize(rq.size() * qrow);
+            ck(cudaMemcpyAsync(bq_id.data(), d_qid.p, bq_id.size() * 4, cudaMemcpyDeviceToHost, stream));
+            ck(cudaMemcpyAsync(bq_p.data(), d_qp.p, bq_p.size() * 4, cudaMemcpyDeviceToHost, stream));
+        }
         sync_ck();
         const auto p2 = std::chrono::steady_clock::now();
         const auto batch = segs;
@@ -4150,8 +4265,14 @@ public:
         for (int i = 0; i < ns; ++i) {
             if (done[i]) continue;
             const auto & g = batch[pi];
+            const size_t qi = pi;
             const auto & draft = plan[pi++].draft;
             select_slot(g.slot);
+            if (batched && any_q && rq[qi].temp > 0.f && bq_p.size() >= (qi + 1) * qrow) {
+                const size_t o = qi * qrow, m = draft.size() * 16;
+                gen.q_id.assign(bq_id.begin() + o, bq_id.begin() + o + m);
+                gen.q_p.assign(bq_p.begin() + o, bq_p.begin() + o + m);
+            }
             uint32_t * r = res.data() + g.col0;
             const int j = accept(draft, r, g.col0);
             ++gen.steps;

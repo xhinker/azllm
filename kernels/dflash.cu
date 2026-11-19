@@ -267,10 +267,39 @@ __global__ void dflash_chain_k(const uint32_t * idx, const float * score, int wa
         tok[i - 1] = idx[i * 16 + b];
     }
 }
+__global__ void dflash_chain_sample_k(const uint32_t * idx, const float * score, int want, float temperature,
+                                      const float * u, uint32_t * tok, uint32_t * q_id, float * q_p) {
+    if (threadIdx.x || blockIdx.x) return;
+    int pred = 0;
+    for (int i = 1; i <= want; ++i) {
+        const float * row = score + (int64_t(i) * 16 + pred) * 16;
+        float mx = row[0];
+        for (int k = 1; k < 16; ++k) mx = fmaxf(mx, row[k]);
+        float q[16], sum = 0.f;
+        for (int k = 0; k < 16; ++k) sum += q[k] = expf((row[k] - mx) / temperature);
+        float r = u[i - 1] * sum;
+        int b = 15;
+        for (int k = 0; k < 16; ++k)
+            if ((r -= q[k]) <= 0.f) { b = k; break; }
+        for (int k = 0; k < 16; ++k) {
+            q_id[(i - 1) * 16 + k] = idx[i * 16 + k];
+            q_p[(i - 1) * 16 + k] = q[k] / sum;
+        }
+        pred = b;
+        tok[i - 1] = idx[i * 16 + b];
+    }
+}
 }  // namespace
 
 void dflash_chain(const uint32_t * idx, const float * score, int want, uint32_t * tok, cudaStream_t s) {
     if (want > 0) dflash_chain_k<<<1, 32, 0, s>>>(idx, score, want, tok);
+}
+
+void dflash_chain_sample(const uint32_t * idx, const float * score, int want, float temperature, const float * u,
+                         uint32_t * tok, uint32_t * q_id, float * q_p, cudaStream_t s) {
+    if (want <= 0) return;
+    if (temperature <= 0.f) dflash_chain_k<<<1, 32, 0, s>>>(idx, score, want, tok);
+    else dflash_chain_sample_k<<<1, 32, 0, s>>>(idx, score, want, temperature, u, tok, q_id, q_p);
 }
 
 void dflash_tree(const uint32_t * idx, const float * score, const uint32_t * anchor, int B, int budget, uint32_t * tok,

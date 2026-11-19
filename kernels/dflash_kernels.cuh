@@ -32,6 +32,11 @@ void dflash_tree(const uint32_t * idx, const float * score, const uint32_t * anc
                  int * par, int * dep, cudaStream_t);
 // Device-side greedy chain (want tokens) from the DFlash2 lattice, the same picks as the host chain.
 void dflash_chain(const uint32_t * idx, const float * score, int want, uint32_t * tok, cudaStream_t);
+// Sampled chain: position i draws from softmax(row / temperature) over its 16 candidates (given the previous pick) with
+// the uniform u[i - 1] in [0, 1); q_id / q_p [want][16] receive each position's proposal for the rejection-sampling
+// verify. temperature <= 0: the greedy chain (q untouched).
+void dflash_chain_sample(const uint32_t * idx, const float * score, int want, float temperature, const float * u,
+                         uint32_t * tok, uint32_t * q_id, float * q_p, cudaStream_t);
 // idx[i] = ids[idx[i]] (draft-vocabulary row -> token id, on the device).
 void map_ids(uint32_t * idx, const uint32_t * ids, int n, cudaStream_t);
 void dflash_lattice(const uint32_t * cand, const float * unary, const __nv_bfloat16 * gate, int gate_stride,

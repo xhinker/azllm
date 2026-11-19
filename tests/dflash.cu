@@ -732,6 +732,55 @@ int main() {
         }
         verdict("dflash_chain", got == ref, "vs host chain");
     }
+    { // device sampled chain == the host draw in dflash_draft_batch (same uniforms), proposals sum to 1
+        const int B = 8, want = 7;
+        const float temp = 0.8f;
+        std::vector<uint32_t> idx(size_t(B) * 16);
+        for (auto & c : idx) c = g() % 248320;
+        std::vector<float> score(size_t(B) * 256), u(static_cast<size_t>(want));
+        for (auto & v : score) v = float(nd(g) * 3);
+        std::uniform_real_distribution<float> uni(0.f, 1.f);
+        for (auto & x : u) x = uni(g);
+        auto * di = dev(idx);
+        auto * ds = dev(score);
+        auto * du = dev(u);
+        auto * dt = dev(std::vector<uint32_t>(size_t(want), 0u));
+        auto * dqi = dev(std::vector<uint32_t>(size_t(want) * 16, 0u));
+        auto * dqp = dev(std::vector<float>(size_t(want) * 16, 0.f));
+        tqllm_cuda::dflash_chain_sample(di, ds, want, temp, du, dt, dqi, dqp, nullptr);
+        const auto got = host(dt, size_t(want));
+        const auto gqi = host(dqi, size_t(want) * 16);
+        const auto gqp = host(dqp, size_t(want) * 16);
+        std::vector<uint32_t> ref;
+        double worst = 0, mass = 0;
+        bool ids_ok = true;
+        for (int i = 1, pred = 0; i <= want; ++i) {
+            const float * row = score.data() + (size_t(i) * 16 + pred) * 16;
+            const float mx = *std::max_element(row, row + 16);
+            float q[16], sum = 0.f;
+            for (int k = 0; k < 16; ++k) sum += q[k] = std::exp((row[k] - mx) / temp);
+            float x = u[size_t(i - 1)] * sum;
+            pred = 15;
+            for (int k = 0; k < 16; ++k)
+                if ((x -= q[k]) <= 0.f) { pred = k; break; }
+            ref.push_back(idx[size_t(i) * 16 + pred]);
+            double s = 0;
+            for (int k = 0; k < 16; ++k) {
+                worst = std::fmax(worst, std::fabs(double(q[k] / sum) - gqp[size_t(i - 1) * 16 + k]));
+                ids_ok &= gqi[size_t(i - 1) * 16 + k] == idx[size_t(i) * 16 + k];
+                s += gqp[size_t(i - 1) * 16 + k];
+            }
+            mass = std::fmax(mass, std::fabs(s - 1));
+        }
+        char d[96];
+        std::snprintf(d, sizeof(d), "q max abs %.2e, |sum q - 1| %.2e", worst, mass);
+        verdict("dflash_chain_sample", got == ref && ids_ok && worst < 1e-5 && mass < 1e-5, d);
+        auto * dg = dev(std::vector<uint32_t>(size_t(want), 0u));  // temperature 0: the greedy chain
+        tqllm_cuda::dflash_chain_sample(di, ds, want, 0.f, nullptr, dg, nullptr, nullptr, nullptr);
+        auto * dc = dev(std::vector<uint32_t>(size_t(want), 0u));
+        tqllm_cuda::dflash_chain(di, ds, want, dc, nullptr);
+        verdict("dflash_chain_sample T=0", host(dg, size_t(want)) == host(dc, size_t(want)), "== dflash_chain");
+    }
     std::printf("%s\n", failures ? "DFLASH TESTS FAILED" : "all dflash tests passed");
     return failures ? 1 : 0;
 }

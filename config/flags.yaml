@@ -77,6 +77,10 @@ flags:
     default: "-"
     doc: "removed"
     replaced_by: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_DFLASH_SAMPLE
+    kind: debug
+    default: "on"
+    doc: "0: sampling requests draft the greedy DFlash2 chain (accepted with p(d)) instead of drawing each draft from the selector's softmax(score / T) and verifying with rejection sampling"
   - name: TQLLM_DFLASH_TQ3
     kind: retired
     default: "-"
